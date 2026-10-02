@@ -1,0 +1,47 @@
+# Open redirect probe payloads - one per line, # lines are comments.
+# Plain external URL
+https://example.com/
+# Protocol-relative
+//example.com/
+# Backslash trick
+\/example.com/
+# Double slash with backslash
+\\example.com/
+# Whitelisted domain prefix bypass
+https://example.com.evil.com/
+# At-sign userinfo bypass
+https://trusted.com@evil.com/
+# At-sign encoded
+https://trusted.com%40evil.com/
+# Fragment bypass
+https://evil.com#trusted.com
+# Query bypass
+https://evil.com?trusted.com
+# Semicolon bypass
+https://evil.com;trusted.com
+# Subdomain of target pattern
+https://trusted.com.evil.com/
+# URL-encoded slashes
+https:%2f%2fevil.com%2f
+# Double-encoded
+https:%252f%252fevil.com%252f
+# Tab/newline injection
+https://evil.com%09
+# CRLF in redirect
+https://evil.com%0d%0a
+# JavaScript scheme (xss-adjacent check)
+javascript:alert(1)
+# Data scheme
+data:text/html,redirect
+# Scheme-relative with port
+//evil.com:443/
+# Dot prefix bypass
+https://.evil.com/
+# Double dot
+https://evil..com/
+# Evil path on trusted domain pattern
+//evil%2ftrusted.com/
+# Unicode slash bypass
+https://evil.com%Ef%bc%8f
+# Backslash encoded
+https://%5cevil.com/

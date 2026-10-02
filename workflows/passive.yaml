@@ -1,0 +1,11 @@
+name: passive
+description: Passive-only recon. No packets are aimed at the target.
+vars:
+  target: ""
+steps:
+  - module: recon
+    target: $target
+    args: {}
+  - module: cve
+    target: $target
+    args: {}

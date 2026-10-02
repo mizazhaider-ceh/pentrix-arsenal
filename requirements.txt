@@ -1,0 +1,3 @@
+rich>=13.0
+pillow>=10.0
+pyyaml>=6.0

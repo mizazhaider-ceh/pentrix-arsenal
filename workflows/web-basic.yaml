@@ -1,0 +1,20 @@
+name: web-basic
+description: Baseline web assessment for a target URL.
+vars:
+  target: ""
+steps:
+  - module: tech
+    target: $target
+    args: {}
+  - module: headers
+    target: $target
+    args: {}
+  - module: cors
+    target: $target
+    args: {}
+  - module: jssecrets
+    target: $target
+    args: {}
+  - module: wordlist
+    target: $target
+    args: {}

