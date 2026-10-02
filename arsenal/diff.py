@@ -142,10 +142,48 @@ def snapshot_path(workspace, target: str, kind: str, name: str) -> str:
 
 
 def save_snapshot(workspace, target: str, kind: str, name: str, snap: dict) -> str:
+    import os
     path = snapshot_path(workspace, target, kind, name)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(snap, fh, indent=2, ensure_ascii=False)
+    hdir = os.path.join(os.path.dirname(path), ".history", _slug(name))
+    os.makedirs(hdir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    with open(os.path.join(hdir, ts + ".json"), "w", encoding="utf-8") as fh:
+        json.dump(snap, fh, indent=2, ensure_ascii=False)
     return path
+
+
+def list_snapshot_names(workspace, target: str):
+    """Yield (kind, name) for every stored latest snapshot of a target."""
+    import os
+    out = []
+    base = _ws_dir(workspace, "snapshots", _slug(target))
+    if not os.path.isdir(base):
+        return out
+    for kind in sorted(os.listdir(base)):
+        kdir = os.path.join(base, kind)
+        if not os.path.isdir(kdir) or kind.startswith("."):
+            continue
+        for fn in sorted(os.listdir(kdir)):
+            if fn.endswith(".json"):
+                out.append((kind, fn[:-5]))
+    return out
+
+
+def load_history(workspace, target: str, kind: str, name: str):
+    """All snapshots for (target, kind, name), oldest first."""
+    import os
+    hdir = os.path.join(_ws_dir(workspace, "snapshots", _slug(target), kind),
+                        ".history", _slug(name))
+    snaps = []
+    if not os.path.isdir(hdir):
+        return snaps
+    for fn in sorted(os.listdir(hdir)):
+        if fn.endswith(".json"):
+            with open(os.path.join(hdir, fn), encoding="utf-8") as fh:
+                snaps.append(json.load(fh))
+    return snaps
 
 
 def load_snapshot(workspace, target: str, kind: str, name: str):
@@ -278,7 +316,7 @@ def cmd_snapshot(args, ctx) -> int:
                 continue
             text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
             snap = snapshot_js(bundle_url, text)
-            path = save_snapshot(ctx.workspace, target, "js", bundle_url)
+            path = save_snapshot(ctx.workspace, target, "js", bundle_url, snap)
             print("saved %s (%d endpoints)" % (path, len(snap["endpoints"])))
             saved += 1
     if "graphql" in kinds and getattr(args, "graphql_url", None):
@@ -295,7 +333,7 @@ def cmd_snapshot(args, ctx) -> int:
             print("graphql introspection failed: %s" % exc)
             schema = None
         snap = snapshot_graphql(args.graphql_url, schema)
-        path = save_snapshot(ctx.workspace, target, "graphql", args.graphql_url)
+        path = save_snapshot(ctx.workspace, target, "graphql", args.graphql_url, snap)
         print("saved %s (%d operations, introspection=%s)" % (
             path, len(snap["operations"]), snap["introspection_enabled"]))
         saved += 1
@@ -303,10 +341,26 @@ def cmd_snapshot(args, ctx) -> int:
 
 
 def cmd_compare(args, ctx) -> int:
-    """Diff stored snapshots for a target against freshly taken ones."""
-    print("compare: re-run snapshot first, then diff old vs new in code via "
-          "arsenal.diff.diff_runs(old, new, target). CLI compare wiring is "
-          "an integrator follow-up.")
+    """Diff the two latest snapshots per (kind, name) for a target."""
+    target = args.target
+    total = 0
+    names = list_snapshot_names(ctx.workspace, target)
+    if not names:
+        print("no snapshots stored for '%s'; run diff snapshot first" % target)
+        return 1
+    for kind, name in names:
+        hist = load_history(ctx.workspace, target, kind, name)
+        if len(hist) < 2:
+            print("%s %s: only one snapshot, nothing to compare yet" % (kind, name))
+            continue
+        for f in diff_runs(hist[-2], hist[-1], target):
+            print("[%s] %s" % (str(f.get("severity", "info")).upper(),
+                               f.get("title", "")))
+            total += 1
+    if total == 0:
+        print("no new surface since the previous snapshot for %s" % target)
+    else:
+        print("%d new-surface finding(s) for %s" % (total, target))
     return 0
 
 
