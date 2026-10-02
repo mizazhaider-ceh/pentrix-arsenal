@@ -31,6 +31,23 @@ DEFAULTS = {
         "max_delay": 2.0,
         "rotate_ua": True,
     },
+    # Outbound proxy. When enabled with a url, all arsenal.http traffic
+    # goes through it (handy for Burp: http://127.0.0.1:8080). An explicit
+    # --proxy flag (when the CLI offers one) wins over this block, and both
+    # win over the HTTP_PROXY / HTTPS_PROXY environment variables.
+    # no_proxy is a comma-separated host list that bypasses the proxy.
+    "proxy": {
+        "enabled": False,
+        "url": "",
+        "no_proxy": "127.0.0.1,localhost",
+    },
+    # HTTP client tuning for arsenal.http.
+    "http": {
+        "retries": 2,        # retries after the first attempt
+        "backoff": 0.5,      # base seconds between retries, doubled each time
+        "max_read_bytes": 8388608,  # response body cap before buffering
+        "pool_size": 8,      # idle keep-alive connections per host
+    },
     "llm": {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o-mini",

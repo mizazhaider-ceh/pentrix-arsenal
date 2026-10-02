@@ -243,6 +243,132 @@ def _triaged(f: dict) -> bool:
     return bool(f.get("triaged")) or bool(f.get("verdict"))
 
 
+_CONF_RANK = {"proven": 0, "strong": 1, "review": 2}
+
+
+def _finding_signals(f: dict) -> dict:
+    """Structured signals for a finding (no free-text keyword matching).
+
+    Uses module/kind/param/host/url fields only.
+    """
+    module = str(f.get("module") or "").lower()
+    kind = str(f.get("kind") or f.get("vuln_class") or "").lower()
+    param = str(f.get("param") or f.get("parameter") or "").lower()
+    host = str(f.get("host") or f.get("target") or "")
+    url = str(f.get("url") or f.get("location") or "")
+    try:
+        from urllib.parse import urlsplit
+        path = urlsplit(url).path.lower() if url else ""
+    except Exception:
+        path = ""
+    return {
+        "module": module,
+        "kind": kind,
+        "param": param,
+        "host": host,
+        "url": url,
+        "path": path,
+        "is_login": kind in ("login-page", "login") or "/login" in path
+                    or path.rstrip("/").endswith(("/signin", "/sign-in", "/auth")),
+        "is_api": kind in ("api-endpoint", "api") or "/api" in path
+                  or "api" in param,
+        "severity": str(f.get("severity") or "").lower(),
+    }
+
+
+def _auto_verify(finding: dict, ctx):
+    """Re-test a finding via arsenal.verify; returns (finding, confidence).
+
+    Never raises; falls back to the finding's own confidence.
+    """
+    try:
+        from arsenal import verify as verify_mod
+        fn = getattr(verify_mod, "verify_finding", None)
+        if callable(fn):
+            updated = fn(dict(finding), ctx)
+            if isinstance(updated, dict):
+                finding = updated
+    except Exception as e:
+        _log(ctx, "warning", "auto-verify unavailable: %s" % e)
+    return finding, str(finding.get("confidence") or "review").lower()
+
+
+def _verify_gate_passes(confidence: str, ctx) -> bool:
+    """Confidence gate for auto-verify: only escalate findings at/above the
+    configured minimum (default "strong")."""
+    cfg = getattr(ctx, "config", None) or {}
+    wanted = "strong"
+    if isinstance(cfg, dict):
+        wanted = str((cfg.get("autopilot") or {}).get("min_verify_confidence",
+                                                      "strong")).lower()
+    else:
+        try:
+            wanted = str(cfg.get("autopilot", {}).get("min_verify_confidence",
+                                                      "strong")).lower()
+        except Exception:
+            pass
+    return _CONF_RANK.get(confidence, 2) <= _CONF_RANK.get(wanted, 1)
+
+
+def _rank_hosts_for_priority(ctx, target, hosts, findings, coverage):
+    """Order hosts with arsenal.priority.rank_targets (best-effort)."""
+    try:
+        from arsenal import priority as priority_mod
+    except Exception:
+        return list(hosts)
+    infos = []
+    for host in hosts:
+        host_findings = [f for f in findings
+                         if str(f.get("host") or f.get("target") or "") == str(host)]
+        urls = [str(f.get("url") or "") for f in host_findings if f.get("url")]
+        alive = next((u for u in urls if u.startswith("https://")), "")
+        if not alive and urls:
+            alive = urls[0]
+        tech = []
+        for f in host_findings:
+            if str(f.get("module") or "").lower() == "tech" and f.get("title"):
+                tech.append(str(f.get("title")))
+        cov = coverage.get(host) if isinstance(coverage, dict) else None
+        infos.append({
+            "host": host,
+            "alive_url": alive,
+            "tech": tech,
+            "has_login": any(s["is_login"] for s in
+                             (_finding_signals(f) for f in host_findings)),
+            "param_count": sum(1 for f in host_findings if f.get("param")),
+            "keywords": [],
+        })
+        _ = cov
+    try:
+        ranked = priority_mod.rank_targets(infos)
+        order = {r["host"]: r["score"] for r in ranked}
+        return sorted(hosts, key=lambda h: order.get(h, 0), reverse=True)
+    except Exception:
+        return list(hosts)
+
+
+def _memory_penalties(ctx, target):
+    """Learn from hunt memory: (kind, detail) -> penalty for zero-yield
+    past decisions, so the planner stops repeating dead ends."""
+    penalties = {}
+    try:
+        from arsenal import memory as memory_mod
+        records = memory_mod.read_memory(ctx, target)
+    except Exception:
+        return penalties
+    for r in records:
+        if not isinstance(r, dict) or r.get("kind") != "decision":
+            continue
+        key = (str(r.get("decision") or ""), str(r.get("reason") or ""))
+        try:
+            new_findings = int(r.get("new_findings") or 0)
+        except (TypeError, ValueError):
+            new_findings = 0
+        if new_findings == 0:
+            penalties[key] = penalties.get(key, 0) + 15
+    return penalties
+
+
 def plan_actions(target, ctx):
     """Build scored candidate actions from workspace state.
 
@@ -258,35 +384,39 @@ def plan_actions(target, ctx):
     actions = []
 
     for f in findings:
-        text = ("%s %s" % (f.get("title", ""), f.get("url", ""))).lower()
-        if "login" in text or "sign in" in text or "auth page" in text:
+        sig = _finding_signals(f)
+        if sig["is_login"]:
             mods = [m for m in _MODULE_HINTS["login_page"] if m in registry]
             actions.append({
                 "kind": "login_page",
-                "detail": f.get("url") or f.get("title") or "login page",
+                "detail": sig["url"] or f.get("title") or "login page",
                 "score": _SCORES["login_page"],
                 "reason": "Login page discovered and never tested: %s" % (f.get("title") or "?"),
                 "modules": mods,
                 "finding": f,
             })
-        if str(f.get("module", "")).lower() == "jsintel" and "api" in text:
+        if sig["module"] == "jsintel" and sig["is_api"]:
             mods = [m for m in _MODULE_HINTS["api_endpoint"] if m in registry]
             actions.append({
                 "kind": "api_endpoint",
-                "detail": f.get("url") or f.get("title") or "api endpoint",
+                "detail": sig["url"] or f.get("title") or "api endpoint",
                 "score": _SCORES["api_endpoint"],
                 "reason": "API endpoint surfaced by jsintel: %s" % (f.get("title") or "?"),
                 "modules": mods,
                 "finding": f,
             })
-        sev = str(f.get("severity", "")).lower()
-        if sev in ("high", "critical") and not _triaged(f):
+        if sig["severity"] in ("high", "critical") and not _triaged(f):
             mods = [m for m in _MODULE_HINTS["untriaged_high"] if m in registry]
+            try:
+                from arsenal import priority as _priority_mod
+                fscore = _priority_mod.score_finding(f)["score"]
+            except Exception:
+                fscore = 0
             actions.append({
                 "kind": "untriaged_high",
                 "detail": f.get("title") or "high finding",
-                "score": _SCORES["untriaged_high"],
-                "reason": "Untriaged %s finding: %s" % (sev, f.get("title") or "?"),
+                "score": _SCORES["untriaged_high"] + min(20, fscore // 5),
+                "reason": "Untriaged %s finding: %s" % (sig["severity"], f.get("title") or "?"),
                 "modules": mods,
                 "finding": f,
             })
@@ -299,7 +429,10 @@ def plan_actions(target, ctx):
     for f in findings:
         if str(f.get("module", "")).lower() in _WEB_MODULES and f.get("host"):
             covered_web.add(str(f.get("host")))
-    for host in hosts:
+    # Hunt priority scoring: most promising unscanned hosts first.
+    ordered_hosts = _rank_hosts_for_priority(ctx, target, hosts, findings,
+                                             coverage)
+    for host in ordered_hosts:
         if host not in covered_web:
             mods = [m for m in _MODULE_HINTS["unscanned_host"] if m in registry]
             actions.append({
@@ -331,12 +464,18 @@ def plan_actions(target, ctx):
     return kept
 
 
-def _penalize_repeats(actions, done):
-    """Lower the score of actions already taken this run so the loop advances."""
+def _penalize_repeats(actions, done, memory_penalties=None):
+    """Lower the score of actions already taken this run (or that yielded
+    nothing in past runs, via hunt memory) so the loop advances."""
+    memory_penalties = memory_penalties or {}
     for a in actions:
-        if (a["kind"], str(a["detail"])) in done:
+        key = (a["kind"], str(a["detail"]))
+        penalty = memory_penalties.get(key, 0)
+        if key in done:
+            penalty += _REPEAT_PENALTY
+        if penalty:
             a = dict(a)
-            a["score"] = max(0, a["score"] - _REPEAT_PENALTY)
+            a["score"] = max(0, a["score"] - penalty)
         yield a
 
 
@@ -387,18 +526,29 @@ def execute_action(action, target, ctx):
     modules_run = []
     new_findings = []
     if action["kind"] == "untriaged_high":
-        # The action itself is triage: verify first if a verifier exists,
-        # then triage the finding in place.
+        # Confidence-gated auto-verify: re-test first, only escalate when
+        # the verified confidence meets the gate.
         f = action.get("finding") or {}
+        verified, confidence = _auto_verify(f, ctx)
+        if not _verify_gate_passes(confidence, ctx):
+            _log(ctx, "info",
+                 "auto-verify held %r at %s confidence; leaving for manual review"
+                 % (verified.get("title", "?"), confidence))
+            held = dict(verified)
+            held["triage_hold"] = (
+                "Auto-verify could not confirm this finding (%s confidence); "
+                "manual review required before escalation." % confidence)
+            _store_findings(ctx, target, [held])
+            return modules_run, [held]
         for name in action["modules"]:
             new_findings.extend(_run_module(name, target, ctx))
             modules_run.append(name)
         try:
             from arsenal import triage  # owned by another builder
-            triaged = triage.triage_all([f], ctx)
+            triaged = triage.triage_all([verified], ctx)
         except Exception as e:
             _log(ctx, "warning", "triage.triage_all unavailable: %s" % e)
-            triaged = [dict(f, triaged=True, verdict="needs_manual_review")]
+            triaged = [dict(verified, triaged=True, verdict="needs_manual_review")]
         _store_findings(ctx, target, triaged)
         new_findings.extend(triaged)
         return modules_run, new_findings
@@ -429,10 +579,15 @@ def run_autopilot(target, ctx, max_cycles=5, intrusive=False, passive=False):
     """Run the sense-plan-act loop. Returns a summary dict. Never prints."""
     run_ctx = _scoped_ctx(ctx, intrusive, passive)
     _ensure_baseline(run_ctx, target)
+    mem_penalties = _memory_penalties(run_ctx, target)
+    if mem_penalties:
+        _log(run_ctx, "info", "hunt memory: penalizing %d zero-yield past actions"
+             % len(mem_penalties))
     done = set()
     cycles = []
     for cycle in range(1, max_cycles + 1):
-        actions = list(_penalize_repeats(plan_actions(target, run_ctx), done))
+        actions = list(_penalize_repeats(plan_actions(target, run_ctx), done,
+                                        mem_penalties))
         actions.sort(key=lambda a: a["score"], reverse=True)
         best = actions[0] if actions else None
         if best is None or best["score"] <= 20:

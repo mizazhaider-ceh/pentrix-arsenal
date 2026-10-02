@@ -14,9 +14,8 @@ are anomalies worth manual follow-up, not confirmed vulnerabilities.
 
 import re
 import urllib.parse
+from arsenal.modules.base import BaseModule
 
-from arsenal.findings import make_finding
-from arsenal.http import fetch
 
 NAME = "fuzz"
 DESCRIPTION = (
@@ -57,62 +56,19 @@ PAYLOAD_SETS = {
 CHARSET_RE = re.compile(r"charset=([\w-]+)", re.IGNORECASE)
 
 
-def _timeout(ctx):
-    cfg = getattr(ctx, "config", None)
-    if isinstance(cfg, dict):
-        return cfg.get("timeout", TIMEOUT)
-    if cfg is not None:
-        return getattr(cfg, "timeout", TIMEOUT)
-    return TIMEOUT
-
-
-def _log(ctx, level, msg):
-    log = getattr(ctx, "log", None)
-    if log is None:
-        return
-    try:
-        getattr(log, level, log.warning)(msg)
-    except Exception:
-        pass
-
-
-def _is_http_url(target):
-    try:
-        parts = urllib.parse.urlsplit(target)
-    except Exception:
-        return False
-    return parts.scheme in ("http", "https") and bool(parts.netloc)
-
-
-def _host_of(url):
-    try:
-        return urllib.parse.urlsplit(url).hostname or ""
-    except Exception:
-        return ""
-
-
-def _in_scope(target, ctx):
-    scope = getattr(ctx, "scope", None)
-    if scope is None:
-        return True
-    try:
-        return bool(scope.contains(_host_of(target)))
-    except Exception:
-        return True
-
-
-def _get(url, ctx):
-    try:
-        return fetch(url, timeout=_timeout(ctx), allow_redirects=True)
-    except Exception as exc:
-        _log(ctx, "debug", "%s: request failed for %s: %s" % (NAME, url, exc))
-        return None
-
-
-def _finding(**kwargs):
-    kwargs.setdefault("module", NAME)
-    return make_finding(**kwargs)
-
+# ---------------------------------------------------------------------------
+# Shared module helpers, bound from arsenal.modules.base (replaces the old
+# per-module copies). All HTTP goes through arsenal.http with ctx, so
+# stealth sleeps, UA rotation and proxy settings apply to module traffic.
+# ---------------------------------------------------------------------------
+_mod = BaseModule(NAME, TIMEOUT)
+_timeout = _mod.timeout
+_log = _mod.log
+_is_http_url = _mod.is_http_url
+_host_of = _mod.host_of
+_in_scope = _mod.in_scope
+_get = _mod.get
+_finding = _mod.finding
 
 def decode_body(headers, body):
     content_type = headers.get("content-type", "")
@@ -125,7 +81,12 @@ def decode_body(headers, body):
 
 
 def choose_payloads(ctx):
-    """Pick payload templates from ctx.tech_hint (list of tech strings)."""
+    """Pick payload templates from ctx.tech_hint (list of tech strings).
+
+    tech_hint is written by the pipeline/service-aware layer (another
+    crew owns that wiring); when it is absent or empty every run falls
+    back to the generic set, so the module works standalone too.
+    """
     hints = getattr(ctx, "tech_hint", None) or []
     hint_text = " ".join(str(h).lower() for h in hints)
     chosen = []
@@ -213,7 +174,7 @@ def _run(target, ctx):
                 reasons.append("length %d -> %d bytes" % (base_len, len(body)))
             if canary in text and canary not in base_text:
                 reasons.append("canary reflected in response")
-            if "49" in text and "49" not in base_text and "7*7" in template:
+            if "49" in text and "49" not in base_text and "7*7" in payload:
                 reasons.append("template math evaluated (49 in response)")
             if reasons:
                 anomalies.append((payload, "; ".join(reasons)))

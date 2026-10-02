@@ -36,21 +36,25 @@ def build_signatures():
             "pattern": re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$"),
             "candidates": ["bcrypt"],
             "note": "bcrypt modular crypt format: $2a$/$2b$/$2y$ + cost + 53-char salt/hash",
+            "hashcat": {"bcrypt": 3200},
         },
         {
             "pattern": re.compile(r"^\$argon2(?:id|i|d)\$.*$"),
             "candidates": ["Argon2"],
             "note": "Argon2 password hash (PHC string format, $argon2i$/$argon2d$/$argon2id$)",
+            "hashcat": {"Argon2": None},
         },
         {
             "pattern": re.compile(r"^\$scrypt\$.*$"),
             "candidates": ["scrypt"],
             "note": "scrypt password hash (PHC string format, $scrypt$)",
+            "hashcat": {"scrypt": 8900},
         },
         {
             "pattern": re.compile(r"^\$7\$.*$"),
             "candidates": ["scrypt"],
             "note": "scrypt modular crypt format ($7$)",
+            "hashcat": {"scrypt": 8900},
         },
         {
             "pattern": re.compile(
@@ -58,6 +62,7 @@ def build_signatures():
             ),
             "candidates": ["SHA-512 crypt", "sha512crypt"],
             "note": "SHA-512 crypt ($6$): glibc/POSIX password hash, 86-char base64-ish payload",
+            "hashcat": {"SHA-512 crypt": 1800, "sha512crypt": 1800},
         },
         {
             "pattern": re.compile(
@@ -65,6 +70,7 @@ def build_signatures():
             ),
             "candidates": ["SHA-256 crypt", "sha256crypt"],
             "note": "SHA-256 crypt ($5$): glibc/POSIX password hash, 43-char base64-ish payload",
+            "hashcat": {"SHA-256 crypt": 7400, "sha256crypt": 7400},
         },
         {
             "pattern": re.compile(
@@ -72,31 +78,37 @@ def build_signatures():
             ),
             "candidates": ["MD5 crypt", "md5crypt"],
             "note": "MD5 crypt ($1$): classic Unix password hash, 22-char base64-ish payload",
+            "hashcat": {"MD5 crypt": 500, "md5crypt": 500},
         },
         {
             "pattern": re.compile(r"^\$pbkdf2-sha(?:1|256|512)\$.*$"),
             "candidates": ["PBKDF2"],
             "note": "PBKDF2 password hash (PHC string format, $pbkdf2-sha...$)",
+            "hashcat": {"PBKDF2": "12000/10900/12100 (SHA1/SHA256/SHA512 PRF)"},
         },
         {
             "pattern": re.compile(r"^\*[0-9A-F]{40}$"),
             "candidates": ["MySQL 4.1+", "MySQL5"],
             "note": "MySQL 4.1+ native password: '*' followed by 40 uppercase hex chars (SHA1(SHA1(password)))",
+            "hashcat": {"MySQL 4.1+": 300, "MySQL5": 300},
         },
         {
             "pattern": re.compile(r"^\$SHA\$[./A-Za-z0-9]+\$[./A-Za-z0-9]+$"),
             "candidates": ["SHA-1 crypt (Cisco)"],
             "note": "SHA-1 crypt ($SHA$): Cisco-IOS style password hash",
+            "hashcat": {"SHA-1 crypt (Cisco)": None},
         },
         {
             "pattern": re.compile(r"^[a-f0-9]{32}$"),
             "candidates": ["MD5", "MD4", "MD2", "NTLM", "LM", "RIPEMD-128", "Haval-128"],
             "note": "32 lowercase hex chars: MD5, NTLM, MD4 and others share this exact format",
+            "hashcat": {"MD5": 0, "MD4": 900, "MD2": None, "NTLM": 1000, "LM": 3000, "RIPEMD-128": None, "Haval-128": None},
         },
         {
             "pattern": re.compile(r"^[A-F0-9]{32}$"),
             "candidates": ["MD5", "MD4", "NTLM", "LM"],
             "note": "32 uppercase hex chars: MD5, NTLM and others (often NTLM stored uppercase)",
+            "hashcat": {"MD5": 0, "MD4": 900, "NTLM": 1000, "LM": 3000},
         },
         {
             "pattern": re.compile(
@@ -104,11 +116,13 @@ def build_signatures():
             ),
             "candidates": ["MD5", "MD4", "NTLM"],
             "note": "32 mixed-case hex chars: MD5, NTLM and others share this format",
+            "hashcat": {"MD5": 0, "MD4": 900, "NTLM": 1000},
         },
         {
             "pattern": re.compile(r"^[a-f0-9]{40}$"),
             "candidates": ["SHA-1", "RIPEMD-160", "Haval-160"],
             "note": "40 lowercase hex chars: SHA-1, RIPEMD-160 and others share this format",
+            "hashcat": {"SHA-1": 100, "RIPEMD-160": 6000, "Haval-160": None},
         },
         {
             "pattern": re.compile(
@@ -116,41 +130,49 @@ def build_signatures():
             ),
             "candidates": ["SHA-1"],
             "note": "40 mixed-case hex chars: SHA-1 and others share this format",
+            "hashcat": {"SHA-1": 100},
         },
         {
             "pattern": re.compile(r"^[a-fA-F0-9]{56}$"),
             "candidates": ["SHA-224", "Haval-224"],
             "note": "56 hex chars: SHA-224 (SHA-2 family), Haval-224",
+            "hashcat": {"SHA-224": 1300, "Haval-224": None},
         },
         {
             "pattern": re.compile(r"^[a-fA-F0-9]{64}$"),
             "candidates": ["SHA-256", "RIPEMD-256", "Haval-256", "GOST R 34.11-94"],
             "note": "64 hex chars: SHA-256 (SHA-2 family) and others share this format",
+            "hashcat": {"SHA-256": 1400, "RIPEMD-256": None, "Haval-256": None, "GOST R 34.11-94": 6900},
         },
         {
             "pattern": re.compile(r"^[a-fA-F0-9]{96}$"),
             "candidates": ["SHA-384"],
             "note": "96 hex chars: SHA-384 (SHA-2 family)",
+            "hashcat": {"SHA-384": 10800},
         },
         {
             "pattern": re.compile(r"^[a-fA-F0-9]{128}$"),
             "candidates": ["SHA-512", "Whirlpool"],
             "note": "128 hex chars: SHA-512 (SHA-2 family), Whirlpool",
+            "hashcat": {"SHA-512": 1700, "Whirlpool": 6100},
         },
         {
             "pattern": re.compile(r"^[a-fA-F0-9]{8}$"),
             "candidates": ["CRC32", "Adler-32"],
             "note": "8 hex chars: likely CRC32 or Adler-32 checksum",
+            "hashcat": {"CRC32": 11500, "Adler-32": None},
         },
         {
             "pattern": re.compile(r"^[a-fA-F0-9]{16}$"),
             "candidates": ["MySQL 3.x (old_password)", "DES crypt (truncated?)", "half-MD5"],
             "note": "16 hex chars: MySQL 3.x old_password, or a truncated hash",
+            "hashcat": {"MySQL 3.x (old_password)": 200, "DES crypt (truncated?)": None, "half-MD5": 5100},
         },
         {
             "pattern": re.compile(r"^[./A-Za-z0-9]{13}$"),
             "candidates": ["DES crypt", "descrypt"],
             "note": "13-char crypt-base64: traditional DES crypt (2-char salt + 11-char hash)",
+            "hashcat": {"DES crypt": 1500, "descrypt": 1500},
         },
     ]
 
@@ -166,7 +188,8 @@ def identify(hash_string):
     for sig in build_signatures():
         if sig["pattern"].match(hash_string):
             matches.append(
-                {"candidates": list(sig["candidates"]), "note": sig["note"]}
+                {"candidates": list(sig["candidates"]), "note": sig["note"],
+                 "hashcat": dict(sig.get("hashcat", {}))}
             )
     return matches
 
@@ -206,14 +229,27 @@ def _finding_for_hash(h):
         confidence = "high" if len(matches) == 1 else "medium"
         weak = [c for c in candidates if c in _WEAK_CANDIDATES]
         cwe = "CWE-327" if weak else None
+        mode_hints = []
+        for m in matches:
+            for cand in m["candidates"]:
+                mode = m["hashcat"].get(cand)
+                if mode is not None and mode != "" and cand not in [
+                        c for c, _ in mode_hints]:
+                    mode_hints.append((cand, mode))
+        if mode_hints:
+            mode_text = "; ".join(
+                "%s: hashcat -m %s" % (cand, mode)
+                for cand, mode in mode_hints)
+        else:
+            mode_text = ("no native hashcat mode for the top candidate; "
+                         "use dedicated tooling")
         remediation = (
             "Weak algorithm identified (%s): migrate stored values to a "
             "memory-hard password hash such as Argon2id or bcrypt, and treat "
-            "any data protected by it as potentially compromised."
-            % ", ".join(weak) if weak else
+            "any data protected by it as potentially compromised. %s."
+            % (", ".join(weak), mode_text) if weak else
             "Use the identified format to select the right analysis method "
-            "(e.g. the correct hashcat mode or dictionary ruleset) before "
-            "further testing."
+            "before further testing. %s." % mode_text
         )
     else:
         title = "Hash format not recognized"

@@ -11,9 +11,8 @@ Intrusive: sends crafted payloads. Detection only: no data extraction.
 
 import re
 import urllib.parse
+from arsenal.modules.base import BaseModule
 
-from arsenal.findings import make_finding
-from arsenal.http import fetch
 
 NAME = "sqli"
 DESCRIPTION = (
@@ -74,65 +73,18 @@ DBMS_SIGNATURES = [
 
 
 # ---------------------------------------------------------------------------
-# Small helpers (module-local so the module stays self-contained)
+# Shared module helpers, bound from arsenal.modules.base (replaces the old
+# per-module copies). All HTTP goes through arsenal.http with ctx, so
+# stealth sleeps, UA rotation and proxy settings apply to module traffic.
 # ---------------------------------------------------------------------------
-
-def _timeout(ctx):
-    cfg = getattr(ctx, "config", None)
-    if isinstance(cfg, dict):
-        return cfg.get("timeout", TIMEOUT)
-    if cfg is not None:
-        return getattr(cfg, "timeout", TIMEOUT)
-    return TIMEOUT
-
-
-def _log(ctx, level, msg):
-    log = getattr(ctx, "log", None)
-    if log is None:
-        return
-    try:
-        getattr(log, level, log.warning)(msg)
-    except Exception:
-        pass
-
-
-def _is_http_url(target):
-    try:
-        parts = urllib.parse.urlsplit(target)
-    except Exception:
-        return False
-    return parts.scheme in ("http", "https") and bool(parts.netloc)
-
-
-def _host_of(url):
-    try:
-        return urllib.parse.urlsplit(url).hostname or ""
-    except Exception:
-        return ""
-
-
-def _in_scope(target, ctx):
-    scope = getattr(ctx, "scope", None)
-    if scope is None:
-        return True
-    try:
-        return bool(scope.contains(_host_of(target)))
-    except Exception:
-        return True
-
-
-def _get(url, ctx):
-    try:
-        return fetch(url, timeout=_timeout(ctx), allow_redirects=True)
-    except Exception as exc:
-        _log(ctx, "debug", "%s: request failed for %s: %s" % (NAME, url, exc))
-        return None
-
-
-def _finding(**kwargs):
-    kwargs.setdefault("module", NAME)
-    return make_finding(**kwargs)
-
+_mod = BaseModule(NAME, TIMEOUT)
+_timeout = _mod.timeout
+_log = _mod.log
+_is_http_url = _mod.is_http_url
+_host_of = _mod.host_of
+_in_scope = _mod.in_scope
+_get = _mod.get
+_finding = _mod.finding
 
 # ---------------------------------------------------------------------------
 # Probe logic (adapted from pentrix-sqli)
@@ -157,10 +109,15 @@ def match_dbms(body):
     return None
 
 
-def build_probe_url(base, params, target_param, payload):
+def build_probe_url(base, params, target_idx, payload):
+    """Build a probe URL replacing the parameter at target_idx only.
+
+    Index-based (not name-based) so ?id=1&id=2 probes each occurrence
+    separately instead of rewriting both at once.
+    """
     probed = [
-        (name, payload if name == target_param else value)
-        for name, value in params
+        (name, payload if i == target_idx else value)
+        for i, (name, value) in enumerate(params)
     ]
     query = urllib.parse.urlencode(probed)
     return "%s?%s" % (base, query)
@@ -175,11 +132,11 @@ def error_snippet(body, signature, radius=140):
     return " ".join(body[start:end].split())
 
 
-def probe_param(base, params, param, baseline_signatures, ctx):
-    """Probe one parameter. Returns (verdict, hits)."""
+def probe_param(base, params, param_idx, baseline_signatures, ctx):
+    """Probe one parameter (by index). Returns (verdict, hits)."""
     hits = []
     for payload in PAYLOADS:
-        url = build_probe_url(base, params, param, payload)
+        url = build_probe_url(base, params, param_idx, payload)
         resp = _get(url, ctx)
         if resp is None:
             continue
@@ -209,10 +166,6 @@ def run_scan(url, ctx):
         return []
     base = urllib.parse.urlunsplit(
         (parts.scheme, parts.netloc, parts.path, "", parts.fragment))
-    names = []
-    for name, _ in params:
-        if name not in names:
-            names.append(name)
 
     resp = _get(url, ctx)
     if resp is None:
@@ -225,9 +178,16 @@ def run_scan(url, ctx):
         baseline_signatures.add(baseline_match[1])
 
     results = []
-    for name in names:
-        verdict, hits = probe_param(base, params, name, baseline_signatures, ctx)
-        results.append({"parameter": name, "verdict": verdict, "hits": hits})
+    name_counts = {}
+    for name, _ in params:
+        name_counts[name] = name_counts.get(name, 0) + 1
+    for idx, (name, _value) in enumerate(params):
+        verdict, hits = probe_param(base, params, idx, baseline_signatures,
+                                    ctx)
+        # Disambiguate repeated parameter names (?id=1&id=2).
+        label = name if name_counts[name] == 1 else "%s#%d" % (name, idx)
+        results.append({"parameter": label,
+                        "verdict": verdict, "hits": hits})
     return results
 
 

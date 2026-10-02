@@ -20,9 +20,8 @@ import json
 import re
 import time
 import urllib.parse
+from arsenal.modules.base import BaseModule
 
-from arsenal.findings import make_finding
-from arsenal.http import fetch
 
 NAME = "jwt"
 DESCRIPTION = (
@@ -68,65 +67,18 @@ KID_SAFE_CHARS = set(
 
 
 # ---------------------------------------------------------------------------
-# Small helpers (module-local so the module stays self-contained)
+# Shared module helpers, bound from arsenal.modules.base (replaces the old
+# per-module copies). All HTTP goes through arsenal.http with ctx, so
+# stealth sleeps, UA rotation and proxy settings apply to module traffic.
 # ---------------------------------------------------------------------------
-
-def _timeout(ctx):
-    cfg = getattr(ctx, "config", None)
-    if isinstance(cfg, dict):
-        return cfg.get("timeout", TIMEOUT)
-    if cfg is not None:
-        return getattr(cfg, "timeout", TIMEOUT)
-    return TIMEOUT
-
-
-def _log(ctx, level, msg):
-    log = getattr(ctx, "log", None)
-    if log is None:
-        return
-    try:
-        getattr(log, level, log.warning)(msg)
-    except Exception:
-        pass
-
-
-def _is_http_url(target):
-    try:
-        parts = urllib.parse.urlsplit(target)
-    except Exception:
-        return False
-    return parts.scheme in ("http", "https") and bool(parts.netloc)
-
-
-def _host_of(url):
-    try:
-        return urllib.parse.urlsplit(url).hostname or ""
-    except Exception:
-        return ""
-
-
-def _in_scope(target, ctx):
-    scope = getattr(ctx, "scope", None)
-    if scope is None:
-        return True
-    try:
-        return bool(scope.contains(_host_of(target)))
-    except Exception:
-        return True
-
-
-def _get(url, ctx):
-    try:
-        return fetch(url, timeout=_timeout(ctx), allow_redirects=True)
-    except Exception as exc:
-        _log(ctx, "debug", "%s: request failed for %s: %s" % (NAME, url, exc))
-        return None
-
-
-def _finding(**kwargs):
-    kwargs.setdefault("module", NAME)
-    return make_finding(**kwargs)
-
+_mod = BaseModule(NAME, TIMEOUT)
+_timeout = _mod.timeout
+_log = _mod.log
+_is_http_url = _mod.is_http_url
+_host_of = _mod.host_of
+_in_scope = _mod.in_scope
+_get = _mod.get
+_finding = _mod.finding
 
 # ---------------------------------------------------------------------------
 # Token handling (adapted from pentrix-jwt)

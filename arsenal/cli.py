@@ -24,6 +24,7 @@ import importlib
 import ipaddress
 import json
 import os
+import re
 import sys
 import time
 from urllib.parse import urlsplit
@@ -120,9 +121,14 @@ def _add_scan(sub):
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--module", metavar="NAME",
                        help="Run a single module from the registry")
+    group.add_argument("--modules", metavar="A,B,C",
+                       help="Run a comma-separated list of modules from the registry")
     group.add_argument("--all", action="store_true",
                        help="Run every applicable module")
     p.add_argument("--scope-file", default=None, help="Path to a scope JSON file")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="HTTP(S) proxy URL, e.g. http://127.0.0.1:8080 "
+                        "(overrides the config proxy block)")
     p.add_argument("--intrusive", action="store_true",
                    help="Allow intrusive modules")
     p.add_argument("--passive", action="store_true",
@@ -133,6 +139,12 @@ def _add_scan(sub):
 def _add_triage(sub):
     p = sub.add_parser("triage", help="Re-triage stored findings for a target")
     p.add_argument("target", help="Target whose stored findings get re-triaged")
+    # CREW D: FP-feedback flags (triage.py owns the feature; triage.py's own
+    # add_parsers is shadowed by this core registration, so flags live here).
+    p.add_argument("--mark-fp", metavar="FID", default=None,
+                   help="Record finding FID as a false positive (teaches future triage)")
+    p.add_argument("--fp-note", default="",
+                   help="Analyst note stored with the false-positive verdict")
     p.set_defaults(func=_cmd_triage)
 
 
@@ -177,6 +189,20 @@ def build_parser():
     # Core feature files owned by this builder.
     _guarded_add("plugins", sub)
     _guarded_add("session", sub)   # registers `replay`
+    # ---- CREW D appended section (CLI UX): new subcommands only. The
+    # scan/recon dispatch above is owned by another crew; do not touch it.
+    _guarded_add("doctor", sub)
+    _add_completions(sub)
+    # ---- end CREW D appended section ----
+    # ---- CREW C appended section: differentiator CLIs ----
+    _add_diff_cmd(sub)
+    _add_oob_cmd(sub)
+    _add_auth_cmd(sub)
+    _add_xsleak_cmd(sub)
+    _add_takeover_cmd(sub)
+    _add_scopex_cmd(sub)
+    _add_recondiff_cmd(sub)
+    # ---- end CREW C appended section ----
     # Other builders' feature files (report/monitor/crm own findings+stats).
     for name in ("report", "monitor", "crm", "ask", "scope", "lab",
                  "checklists", "goals", "autopilot", "memory", "workflows",
@@ -232,6 +258,101 @@ def _passive_banner():
 def _passive_allowed(name):
     from arsenal.pipeline import PASSIVE_MODULES
     return name in PASSIVE_MODULES or name.replace("_mod", "") in PASSIVE_MODULES
+
+
+def _target_shape(target):
+    """Classify a raw scan target into a shape word.
+
+    Returns one of: url, domain, ip, token, hash, keyword, path, unknown.
+    """
+    text = (target or "").strip()
+    if not text:
+        return "unknown"
+    if os.path.exists(os.path.expanduser(text)):
+        return "path"
+    if "://" in text:
+        scheme = text.split("://", 1)[0].lower()
+        return "url" if scheme in ("http", "https") else "unknown"
+    try:
+        ipaddress.ip_address(text)
+        return "ip"
+    except ValueError:
+        pass
+    if re.match(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$", text):
+        # A bare domain like sub.example.com also has three segments;
+        # real JWTs start with eyJ (or are very long).
+        first = text.split(".", 1)[0]
+        if first.startswith("eyJ") or len(text) > 60:
+            return "token"
+    if re.match(r"^[a-fA-F0-9]{16,}$", text):
+        return "hash"
+    if "." in text and " " not in text and "/" not in text:
+        return "domain"
+    if re.match(r"^[A-Za-z0-9_.-]+$", text):
+        return "keyword"
+    return "unknown"
+
+
+def _host_of_target(target):
+    try:
+        return urlsplit(target).hostname or ""
+    except Exception:
+        return ""
+
+
+def _route_module(mod, target, shape):
+    """Map (module, target shape) to a concrete target string, or None.
+
+    Used by `scan --all` so modules only run against targets they can
+    actually handle: jwt/secrets/hashid/cve/wordlist/phish no longer run
+    against mistyped targets. URL modules get a full URL built from bare
+    domains; domain modules get the bare host extracted from URLs.
+    """
+    kind = getattr(mod, "TARGET_KIND", "url")
+    if kind == "url":
+        if shape == "url":
+            return target
+        if shape == "domain":
+            return "https://" + target
+        if shape == "ip":
+            return "http://" + target
+        return None
+    if kind == "domain":
+        if shape == "domain":
+            return target
+        if shape == "url":
+            return _host_of_target(target) or None
+        return None
+    if kind == "ip":
+        # portscan resolves hostnames itself.
+        if shape in ("ip", "domain"):
+            return target
+        if shape == "url":
+            return _host_of_target(target) or None
+        return None
+    if kind == "token":
+        # jwt also scrapes tokens off a URL page when pointed at one.
+        return target if shape in ("token", "url") else None
+    if kind == "hash":
+        return target if shape == "hash" else None
+    if kind == "path":
+        return target if shape == "path" else None
+    if kind == "keyword":
+        return target if shape == "keyword" else None
+    return None
+
+
+def _scope_allows(scope, target):
+    """Scope-firewall check with URL targets normalized before matching.
+
+    Scope.contains() strips scheme, userinfo, path, query, fragment and
+    port, so "https://example.com/page" matches a scope entry for
+    example.com instead of refusing every URL target.
+    """
+    try:
+        return bool(scope.contains(target))
+    except Exception:
+        return False
 
 
 def _coerce(value):
@@ -298,6 +419,18 @@ def _cmd_recon(args, ctx):
     return 1 if summary.get("error") else 0
 
 
+def _apply_proxy_override(args, ctx):
+    """Apply an explicit --proxy flag onto ctx.config.
+
+    Overrides the config proxy block entirely and clears no_proxy: an
+    explicit proxy is the strongest user intent, everything goes through it.
+    """
+    if getattr(args, "proxy", None):
+        cfg = dict(ctx.config or {})
+        cfg["proxy"] = {"enabled": True, "url": args.proxy, "no_proxy": ""}
+        ctx.config = cfg
+
+
 def _cmd_scan(args, ctx):
     from arsenal import modules as modules_pkg
     from arsenal.pipeline import run_module
@@ -311,8 +444,16 @@ def _cmd_scan(args, ctx):
         ctx.log.warning("plugin load failed: %s", exc)
     if args.all:
         names = sorted(registry.keys())
+    elif getattr(args, "modules", None):
+        names = [n.strip() for n in args.modules.split(",") if n.strip()]
+        if not names:
+            print("error: --modules needs at least one module name",
+                  file=sys.stderr)
+            return 2
     else:
         names = [args.module]
+    shape = _target_shape(args.target) if args.all else None
+    _apply_proxy_override(args, ctx)
     if args.passive:
         _passive_banner()
     ctx.passive = bool(args.passive)
@@ -333,6 +474,15 @@ def _cmd_scan(args, ctx):
             if not args.all:
                 return 2
             continue
+        target = args.target
+        if args.all:
+            routed = _route_module(mod, args.target, shape)
+            if routed is None:
+                print("skipping '%s': target is %s, module needs %s"
+                      % (name, shape,
+                         getattr(mod, "TARGET_KIND", "url")))
+                continue
+            target = routed
         if args.passive and not _passive_allowed(name):
             print("skipping '%s': not permitted in passive mode" % name)
             continue
@@ -344,11 +494,11 @@ def _cmd_scan(args, ctx):
             print("error: module '%s' is intrusive; re-run with --intrusive"
                   % name, file=sys.stderr)
             return 2
-        res = run_module(mod, args.target, ctx)
+        res = run_module(mod, target, ctx)
         findings = res["findings"]
         try:
-            ctx.workspace.save_scan(args.target, name, findings)
-            ctx.workspace.append_findings(args.target, findings)
+            ctx.workspace.save_scan(target, name, findings)
+            ctx.workspace.append_findings(target, findings)
         except Exception as exc:
             ctx.log.warning("workspace save failed for %s: %s", name, exc)
         print("%s: %d findings" % (name, len(findings)))
@@ -359,6 +509,23 @@ def _cmd_scan(args, ctx):
 
 
 def _cmd_triage(args, ctx):
+    # CREW D: FP-feedback short-circuit (feature owned by triage.py).
+    if getattr(args, "mark_fp", None):
+        from arsenal import triage as triage_mod
+        findings = ctx.workspace.all_findings(args.target)
+        wanted = str(args.mark_fp).upper()
+        match = next((f for f in findings
+                      if str(f.get("id", "")).upper() == wanted), None)
+        if match is None:
+            print("no finding %s stored for '%s'" % (args.mark_fp, args.target))
+            return 1
+        if triage_mod.record_fp_verdict(match, ctx,
+                                        analyst_note=getattr(args, "fp_note", "")):
+            print("recorded false-positive feedback for %s; future matching "
+                  "findings will be auto-suppressed." % wanted)
+            return 0
+        print("error: could not store FP feedback", file=sys.stderr)
+        return 1
     from arsenal.pipeline import call_optional
     findings = ctx.workspace.all_findings(args.target)
     if not findings:
@@ -425,10 +592,11 @@ def main(argv=None):
     except Exception:
         pass
 
-    # Scope firewall: enforced before any recon/scan work.
+    # Scope firewall: enforced before any recon/scan work. URL targets are
+    # normalized inside Scope.contains (scheme/path/query/port stripped).
     if command in ("recon", "scan"):
         target = getattr(args, "target", None)
-        if target and scope is not None and not scope.contains(target):
+        if target and scope is not None and not _scope_allows(scope, target):
             print("error: target '%s' is outside the authorized scope; "
                   "refusing to scan" % target, file=sys.stderr)
             return 2
@@ -457,3 +625,116 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---- CREW D appended section (CLI UX): `arsenal completions`. Kept here so
+# build_parser() above stays untouched apart from its own marked block.
+import os as _os
+
+
+def _add_completions(sub):
+    p = sub.add_parser("completions", help="Print shell completion scripts")
+    p.add_argument("--shell", default="bash", choices=["bash", "zsh", "fish"],
+                   help="Shell flavor to print (default: bash)")
+    p.set_defaults(func=_cmd_completions)
+    return p
+
+
+def _cmd_completions(args, ctx):
+    path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                         "completions", "arsenal.%s" % args.shell)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            sys.stdout.write(fh.read())
+        return 0
+    except OSError as exc:
+        print("error: could not read %s: %s" % (path, exc), file=sys.stderr)
+        return 1
+# ---- end CREW D appended section ----
+
+
+# ---- CREW C appended section: differentiator subcommands ----
+def _add_diff_cmd(sub):
+    from arsenal import diff as _m
+    p = sub.add_parser("diff", help="JS bundle / GraphQL schema snapshot diffing")
+    dsub = p.add_subparsers(dest="diff_cmd", required=True)
+    sn = dsub.add_parser("snapshot", help="Snapshot JS bundles / GraphQL schema")
+    sn.add_argument("--target", required=True)
+    sn.add_argument("--kind", default="js,graphql")
+    sn.add_argument("--js-url", action="append", default=[])
+    sn.add_argument("--graphql-url")
+    sn.set_defaults(func=_m.cmd_snapshot)
+    cp = dsub.add_parser("compare", help="Diff runs")
+    cp.add_argument("--target", required=True)
+    cp.set_defaults(func=_m.cmd_compare)
+
+
+def _add_oob_cmd(sub):
+    from arsenal import oob as _m
+    p = sub.add_parser("oob", help="OOB callback correlation engine")
+    osub = p.add_subparsers(dest="oob_cmd", required=True)
+    m = osub.add_parser("mint", help="Mint a token + callback URL for a payload")
+    m.add_argument("--class", dest="vuln_class", required=True)
+    m.add_argument("--target", required=True)
+    m.add_argument("--param", default="")
+    m.add_argument("--method", default="GET")
+    m.add_argument("--base-url", required=True)
+    m.set_defaults(func=_m.cmd_mint)
+    pl = osub.add_parser("poll", help="Poll inbox and link callbacks to requests")
+    pl.add_argument("--base-url", default="")
+    pl.add_argument("--wait", type=float, default=0.0)
+    pl.set_defaults(func=_m.cmd_poll)
+
+
+def _add_auth_cmd(sub):
+    from arsenal import auth as _m
+    p = sub.add_parser("auth", help="Shared auth session manager")
+    asub = p.add_subparsers(dest="auth_cmd", required=True)
+    lg = asub.add_parser("login", help="Store a login session in a profile")
+    lg.add_argument("--profile", required=True)
+    lg.add_argument("--url")
+    lg.add_argument("--username"); lg.add_argument("--password")
+    lg.add_argument("--bearer")
+    lg.add_argument("--basic", action="store_true")
+    lg.set_defaults(func=_m.cmd_login)
+    st = asub.add_parser("status", help="List profiles / show session state")
+    st.set_defaults(func=_m.cmd_status)
+
+
+def _add_xsleak_cmd(sub):
+    from arsenal import xsleak as _m
+    p = sub.add_parser("xsleak", help="XS-Leak PoC generator")
+    xsub = p.add_subparsers(dest="xsleak_cmd", required=True)
+    xsub.add_parser("list", help="List XS-Leak classes").set_defaults(func=_m.cmd_list)
+    g = xsub.add_parser("gen", help="Generate a test page for a class")
+    g.add_argument("--class", dest="cls", required=True)
+    g.add_argument("--target", required=True)
+    g.set_defaults(func=_m.cmd_gen)
+
+
+def _add_takeover_cmd(sub):
+    from arsenal import takeover as _m
+    p = sub.add_parser("takeover", help="Continuous takeover monitoring")
+    p.add_argument("--hosts", nargs="+", required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=_m.cmd_takeover)
+
+
+def _add_scopex_cmd(sub):
+    from arsenal import scopex as _m
+    p = sub.add_parser("scopex", help="Smart scope expansion")
+    p.add_argument("--domain", required=True)
+    p.add_argument("--org", default="")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=_m.cmd_scopex)
+
+
+def _add_recondiff_cmd(sub):
+    from arsenal import recon_diff as _m
+    p = sub.add_parser("recondiff", help="Recon diff reports")
+    p.add_argument("--target", required=True)
+    p.add_argument("--subdomains", nargs="*", default=None)
+    p.add_argument("--endpoints", nargs="*", default=None)
+    p.add_argument("--format", choices=["md", "json"], default="md")
+    p.set_defaults(func=_m.cmd_recondiff)
+# ---- end CREW C appended section ----

@@ -1,0 +1,37 @@
+name: business-logic
+description: >-
+  Business-logic flaw hunt pack. Automated discovery (paths, parameters,
+  roles) plus structured manual checkpoints: IDOR/BOLA swap matrices,
+  two-session differential testing, price tampering, and step-skip/replay.
+  The scanner cannot decide business rules for you; this flow gets you to
+  the decision points fast and in order.
+vars:
+  target: ""
+steps:
+  - module: tech
+    target: $target
+    args: {}
+  - module: wordlist
+    target: $target
+    args: {}
+  # Hidden parameters only matter once we know there are interesting paths.
+  - module: paramminer
+    target: $target
+    args: {}
+    if: "findings > 0"
+  - parallel:
+      - module: fuzz
+        target: $target
+        args: {}
+      - module: jssecrets
+        target: $target
+        args: {}
+  # Manual checkpoints the analyst works through after the automation:
+  #  1. IDOR/BOLA: for every object reference found, replay with a second
+  #     account's identifier and diff the responses.
+  #  2. Two-session differential: perform the same privileged action as a
+  #     low-privilege user and as an admin; any divergence is a finding.
+  #  3. Price tampering: intercept quantity/currency/total fields at each
+  #     checkout step and submit out-of-range values (0, -1, 999999).
+  #  4. Step-skip/replay: request multi-step flow URLs out of order and
+  #     replay state-changing requests to test idempotency.

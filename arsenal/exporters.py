@@ -2,11 +2,15 @@
 
     arsenal export <target> --format nuclei|burp-xml [--out PATH]
 
-nuclei:  emits skeletal Nuclei YAML templates (with TODO markers) for
-         high/critical findings with strong (high/proven/strong)
-         confidence. Each document is valid YAML.
-burp-xml: emits a well-formed Burp site-map XML
-         (<items><item><url>...</url>...) of discovered in-scope URLs.
+nuclei:  emits RUNNABLE Nuclei YAML templates built from confirmed
+         (high/critical, strong/proven confidence) findings. The raw
+         request is reconstructed from the finding's url/payload and the
+         matcher is derived from its evidence; findings without enough
+         data to build a runnable check are skipped with a notice (no
+         TODO skeletons are emitted).
+burp-xml: emits a well-formed Burp site-map XML where every finding
+         becomes an <item> carrying the finding details in <comment>,
+         followed by plain discovered-URL items.
 
 Findings are read from the target workspace's findings.json
 (~/.arsenal/workspace/<target>/findings.json).
@@ -76,48 +80,125 @@ def _slug(text: str) -> str:
     return text[:48] or "finding"
 
 
-def _nuclei_template(finding, target, index: int) -> str:
+def _nuclei_request(finding):
+    """Reconstruct a runnable raw HTTP request from a finding.
+
+    Returns (raw_request_text, matcher_dsl) or (None, None) when the
+    finding lacks the url/payload/evidence needed for a real check.
+    """
+    url = str(finding.get("url") or finding.get("location") or "").strip()
+    payload = str(finding.get("payload") or "").strip()
+    evidence = str(finding.get("evidence") or "").strip()
+    if not url:
+        target = str(finding.get("target") or "")
+        if target.startswith(("http://", "https://")):
+            url = target
+    if not url:
+        return None, None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None, None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return None, None
+    path = parts.path or "/"
+    query = parts.query or ""
+    marker = ""
+    if payload:
+        # Inject the recorded payload into the first query parameter so the
+        # template replays the exact probe that produced the finding.
+        from urllib.parse import parse_qsl, urlencode
+        try:
+            pairs = parse_qsl(query, keep_blank_values=True)
+        except Exception:
+            pairs = []
+        if pairs:
+            pairs[0] = (pairs[0][0], payload)
+            query = urlencode(pairs)
+        elif query:
+            query = payload
+        else:
+            query = "arsenal_probe=" + payload
+        marker = payload[:80]
+    elif evidence:
+        marker = evidence[:80]
+    if not marker:
+        return None, None
+    request_line = "GET %s HTTP/1.1" % (path + ("?" + query if query else ""))
+    host_hdr = parts.hostname
+    if parts.port and parts.port not in (80, 443):
+        host_hdr += ":%d" % parts.port
+    raw = "%s\nHost: %s\nUser-Agent: Mozilla/5.0 (compatible; pentrix-arsenal)\nAccept: */*\nConnection: close\n\n" % (
+        request_line, host_hdr)
+    # Escape for a double-quoted DSL string.
+    dsl_marker = marker.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    dsl = 'contains(body, "%s")' % dsl_marker
+    return raw, dsl
+
+
+def _nuclei_template(finding, target, index: int):
     module = str(finding.get("module") or "unknown")
     title = str(finding.get("title") or "Untitled finding")
     severity = str(finding.get("severity") or "high").lower()
-    cwe = finding.get("cwe") or "TODO"
-    return (
-        f"id: arsenal-{_slug(module)}-{index}\n"
-        "info:\n"
-        f"  name: {_yaml_str(title)}\n"
-        "  author: pentrix-arsenal\n"
-        f"  severity: {severity}\n"
-        "  description: |\n"
-        "    TODO: describe the vulnerability and its impact in your own words.\n"
-        "  remediation: |\n"
-        "    TODO: describe the recommended fix.\n"
-        "  reference:\n"
-        "    - TODO: add reference URLs\n"
-        "  tags: arsenal,todo\n"
-        "  metadata:\n"
-        f"    target: {_yaml_str(target)}\n"
-        f"    cwe: {_yaml_str(cwe)}\n"
-        "http:\n"
-        "  - raw:\n"
-        "      - |\n"
-        "        TODO: paste the raw HTTP request that reproduces the finding\n"
-        "    matchers:\n"
-        "      - type: dsl\n"
-        "        dsl:\n"
-        "          - 'TODO: write a matcher, e.g. status_code == 200 && contains(body, \"marker\")'\n"
-        "        condition: and\n"
-    )
+    if severity not in ("critical", "high", "medium", "low", "info", "unknown"):
+        severity = "high"
+    description = str(finding.get("description") or finding.get("triage_reason") or "").strip()
+    remediation = str(finding.get("remediation") or "").strip()
+    raw, dsl = _nuclei_request(finding)
+    lines = [
+        "id: arsenal-%s-%d" % (_slug(module), index),
+        "info:",
+        "  name: %s" % _yaml_str(title),
+        "  author: pentrix-arsenal",
+        "  severity: %s" % severity,
+        "  description: |",
+    ]
+    for dline in (description or "Finding reported by PENTRIX ARSENAL.").splitlines():
+        lines.append("    " + dline)
+    if remediation:
+        lines.append("  remediation: |")
+        for rline in remediation.splitlines():
+            lines.append("    " + rline)
+    lines.append("  tags: arsenal,verified")
+    cwe = finding.get("cwe")
+    lines.append("  metadata:")
+    lines.append("    target: %s" % _yaml_str(target))
+    if cwe:
+        lines.append("    cwe: %s" % _yaml_str(cwe))
+    lines.append("http:")
+    lines.append("  - raw:")
+    lines.append("      - |")
+    for rline in raw.rstrip("\n").splitlines():
+        lines.append("        " + rline)
+    lines.append("    matchers:")
+    lines.append("      - type: dsl")
+    lines.append("        dsl:")
+    lines.append("          - '%s'" % dsl.replace("'", "''"))
+    lines.append("        condition: and")
+    return "\n".join(lines) + "\n"
 
 
 def _export_nuclei(target, ctx, out_path: Path) -> int:
     findings, src = _load_findings(target, ctx)
     strong = [f for f in findings if _is_strong(f)]
     if not strong:
-        console.print(f"[yellow]No high/critical strong-confidence findings for '{target}'. Nothing to export.[/]")
+        console.print("[yellow]No high/critical strong-confidence findings for '%s'. Nothing to export.[/]" % target)
         return 1
-    docs = "\n---\n".join(_nuclei_template(f, target, i) for i, f in enumerate(strong, 1))
-    out_path.write_text(docs + "\n", encoding="utf-8")
-    console.print(f"[green]Wrote {len(strong)} skeletal nuclei template(s) to {out_path}[/]")
+    docs, skipped = [], 0
+    for i, f in enumerate(strong, 1):
+        raw, _dsl = _nuclei_request(f)
+        if raw is None:
+            skipped += 1
+            continue
+        docs.append(_nuclei_template(f, target, i))
+    if not docs:
+        console.print("[yellow]None of the %d strong finding(s) had enough data "
+                      "(url + payload/evidence) for a runnable template. Nothing to export.[/]" % len(strong))
+        return 1
+    out_path.write_text("\n---\n".join(docs), encoding="utf-8")
+    console.print("[green]Wrote %d runnable nuclei template(s) to %s[/]" % (len(docs), out_path))
+    if skipped:
+        console.print("[dim]Skipped %d finding(s) lacking replay data.[/]" % skipped)
     return 0
 
 
@@ -164,29 +245,80 @@ def _collect_urls(target, ctx):
     return sorted(clean)
 
 
+def _finding_url(finding):
+    """Best-effort http(s) URL for a finding, or None."""
+    for key in ("url", "location"):
+        val = str(finding.get(key) or "").strip()
+        if val.lower().startswith(("http://", "https://")):
+            return val
+    target = str(finding.get("target") or "").strip()
+    if target.lower().startswith(("http://", "https://")):
+        return target
+    return None
+
+
+def _finding_comment(finding) -> str:
+    sev = str(finding.get("severity") or "info").upper()
+    title = str(finding.get("title") or "untitled")
+    module = str(finding.get("module") or "?")
+    conf = str(finding.get("confidence") or "?")
+    evidence = str(finding.get("evidence") or "").strip().replace("\n", " | ")
+    comment = "[%s/%s] %s (%s)" % (sev, conf, title, module)
+    if evidence:
+        comment += " -- %s" % (evidence[:300] + ("..." if len(evidence) > 300 else ""))
+    verdict = finding.get("verdict")
+    if verdict:
+        comment += " [triage: %s]" % verdict
+    return comment
+
+
+def _add_burp_item(root, url, comment=""):
+    parts = urlsplit(url)
+    item = ET.SubElement(root, "item")
+    ET.SubElement(item, "url").text = url
+    host = ET.SubElement(item, "host")
+    host.set("ip", "")
+    host.text = parts.hostname or ""
+    ET.SubElement(item, "path").text = parts.path or "/"
+    ET.SubElement(item, "protocol").text = parts.scheme
+    default_port = 443 if parts.scheme == "https" else 80
+    ET.SubElement(item, "port").text = str(parts.port or default_port)
+    ET.SubElement(item, "query").text = parts.query or ""
+    ET.SubElement(item, "status").text = ""
+    ET.SubElement(item, "responselength").text = ""
+    ET.SubElement(item, "mimetype").text = ""
+    ET.SubElement(item, "comment").text = comment
+
+
 def _export_burp_xml(target, ctx, out_path: Path) -> int:
-    urls = _collect_urls(target, ctx)
-    if not urls:
-        console.print(f"[yellow]No discovered URLs for '{target}'. Nothing to export.[/]")
-        return 1
+    findings, _src = _load_findings(target, ctx)
     root = ET.Element("items")
     root.set("burpVersion", "2026.2")
-    for u in urls:
-        parts = urlsplit(u)
-        item = ET.SubElement(root, "item")
-        ET.SubElement(item, "url").text = u
-        host = ET.SubElement(item, "host")
-        host.set("ip", "")
-        host.text = parts.hostname or ""
-        ET.SubElement(item, "path").text = parts.path or "/"
-        ET.SubElement(item, "protocol").text = parts.scheme
-        default_port = 443 if parts.scheme == "https" else 80
-        ET.SubElement(item, "port").text = str(parts.port or default_port)
-        ET.SubElement(item, "query").text = parts.query or ""
-        ET.SubElement(item, "status").text = ""
-        ET.SubElement(item, "responselength").text = ""
-        ET.SubElement(item, "mimetype").text = ""
-        ET.SubElement(item, "comment").text = ""
+    count = 0
+    covered = set()
+    # Findings first: each becomes an item carrying its details in <comment>.
+    for f in findings:
+        url = _finding_url(f)
+        if not url:
+            continue
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            continue
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            continue
+        _add_burp_item(root, url, _finding_comment(f))
+        covered.add(url)
+        count += 1
+    # Then the plain discovered-URL site map for context.
+    for url in _collect_urls(target, ctx):
+        if url in covered:
+            continue
+        _add_burp_item(root, url)
+        count += 1
+    if not count:
+        console.print("[yellow]No findings or discovered URLs for '%s'. Nothing to export.[/]" % target)
+        return 1
     tree = ET.ElementTree(root)
     try:
         ET.indent(tree, space="  ")
@@ -194,7 +326,9 @@ def _export_burp_xml(target, ctx, out_path: Path) -> int:
         pass
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tree.write(str(out_path), encoding="utf-8", xml_declaration=True)
-    console.print(f"[green]Wrote {len(urls)} URL(s) as Burp site-map XML to {out_path}[/]")
+    n_findings = sum(1 for _ in findings if _finding_url(_))
+    console.print("[green]Wrote %d item(s) (%d with finding details) as Burp site-map XML to %s[/]"
+                  % (count, min(n_findings, count), out_path))
     return 0
 
 
@@ -214,9 +348,10 @@ def add_parsers(sub):
         "export",
         help="Export findings/URLs to tool formats (nuclei, burp-xml)",
         description=(
-            "nuclei: skeletal YAML templates (with TODO markers) for "
-            "high/critical strong-confidence findings. burp-xml: a "
-            "well-formed Burp site-map XML of discovered in-scope URLs."
+            "nuclei: runnable YAML templates for high/critical "
+            "strong-confidence findings (skips findings without replay "
+            "data; never emits TODO skeletons). burp-xml: Burp site-map XML "
+            "with one commented item per finding plus discovered URLs."
         ),
     )
     p.add_argument("target", help="Target identifier (as stored in the workspace)")

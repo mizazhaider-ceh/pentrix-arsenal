@@ -5,9 +5,15 @@ info finding per CVE, with the CVE ID, CVSS score and a summary.
 Severity is mapped from the CVSS base score:
 >=9 critical, >=7 high, >=4 medium, otherwise low.
 
+An NVD API key raises the rate limit from ~5 to ~50 requests per 30s.
+Set the NVD_API_KEY environment variable (free at
+https://nvd.nist.gov/developers/request-an-api-key); the module picks it
+up automatically and sends it as the apiKey header.
+
 Adapted from pentrix-cve (search / normalize / cvss parsing).
 """
 
+import os
 import urllib.parse
 
 from arsenal.findings import make_finding
@@ -22,6 +28,15 @@ NVD_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 10
 _DEFAULT_TIMEOUT = 15
+
+
+def _api_key():
+    """NVD API key from the environment, or None.
+
+    Never stored in config; read fresh each call so tests can monkeypatch
+    the environment.
+    """
+    return os.environ.get("NVD_API_KEY") or None
 
 
 def cvss_for(cve):
@@ -91,18 +106,24 @@ def normalize(cve):
     }
 
 
-def search(keyword, limit, timeout):
+def search(keyword, limit, timeout, ctx=None, api_key=None):
     """Search NVD by keyword, returning up to `limit` normalized dicts.
 
-    Adapted from pentrix-cve; uses arsenal.http.fetch_json.
+    Adapted from pentrix-cve; uses arsenal.http.fetch_json. When api_key
+    (or the NVD_API_KEY env var) is set it is sent as the apiKey header,
+    raising NVD's rate limit. ctx is passed through for stealth/proxy.
     """
+    if api_key is None:
+        api_key = _api_key()
     params = {
         "keywordSearch": keyword,
         "resultsPerPage": min(max(limit, 1), 50),
         "startIndex": 0,
     }
     url = NVD_BASE + "?" + urllib.parse.urlencode(params)
-    status, data, _final = fetch_json(url, timeout=timeout)
+    headers = {"apiKey": api_key} if api_key else None
+    status, data, _final = fetch_json(url, timeout=timeout, headers=headers,
+                                      ctx=ctx)
     if status == 0 or not isinstance(data, dict):
         raise RuntimeError("NVD request failed (status %s)" % status)
     vulns = data.get("vulnerabilities", [])
@@ -165,7 +186,7 @@ def run(target, ctx):
     timeout = max(1, timeout)
 
     try:
-        items = search(target, limit, timeout)
+        items = search(target, limit, timeout, ctx=ctx)
     except Exception as exc:
         return [make_finding(
             module=NAME,
@@ -178,8 +199,10 @@ def run(target, ctx):
                         "were returned, not a clean bill of health." % (target, exc),
             evidence="keyword: %s" % target,
             cwe=None,
-            remediation="Wait a few minutes and retry, or request a free NVD "
-                        "API key at https://nvd.nist.gov/developers/request-an-api-key.",
+            remediation="Wait a few minutes and retry, or set the NVD_API_KEY "
+                        "environment variable (free key at "
+                        "https://nvd.nist.gov/developers/request-an-api-key) "
+                        "to raise NVD's rate limit.",
         )]
     except Exception as exc:
         return [make_finding(

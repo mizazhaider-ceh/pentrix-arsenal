@@ -23,6 +23,10 @@ _MODULE_FILES = [
     "redirect_mod", "fuzz_mod", "paramminer_mod", "graphql_mod", "oauth_mod",
     "ssti_mod", "ppollution_mod", "cachepoison_mod", "hostheader_mod",
     "wordlist_mod", "hashid_mod", "phish_mod", "secrets_mod", "cve_mod",
+"ssrf_mod", "lfi_mod", "xxe_mod", "smuggle_mod", "ws_mod",
+    "idor_mod", "auth_mod", "csrf_mod", "ldap_mod", "xpath_mod",
+    "deserial_mod", "sqli_blind_mod", "jwt_adv_mod", "graphql_adv_mod",
+    "ssti_adv_mod", "cachematrix_mod", "http3_mod", "grpc_mod", "race_mod",
 ]
 
 

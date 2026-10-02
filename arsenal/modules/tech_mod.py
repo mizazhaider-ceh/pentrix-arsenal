@@ -13,6 +13,7 @@ import urllib.parse
 
 from arsenal.http import fetch
 from arsenal.findings import make_finding
+from arsenal.modules.base import BaseModule
 
 NAME = "tech"
 DESCRIPTION = "Technology fingerprinting from headers, HTML markers and favicon hash"
@@ -21,6 +22,8 @@ INTRUSIVE = False
 
 FETCH_TIMEOUT = 10
 BODY_SCAN_LIMIT = 2_000_000
+
+_mod = BaseModule(NAME, FETCH_TIMEOUT)
 
 # (technology, kind, [regexes]); first capture group, if numeric, is a version.
 LIB_PATTERNS = [
@@ -40,9 +43,16 @@ LIB_PATTERNS = [
     ("PHP", "Language", [r"\.php(?:[?\"'])", r"PHPSESSID"]),
     ("Bootstrap", "CSS framework", [r"bootstrap[.-](\d[\d.]*)"]),
     ("Tailwind CSS", "CSS framework", [r"tailwind"]),
+    ("GraphQL", "API", [r"/graphql", r"__graphql", r"graphql"]),
+    ("Spring", "Framework", [r"springframework", r"X-Application-Context",
+                             r"JSESSIONID"]),
+    ("Express", "Framework", [r"express", r"X-Powered-By:\s*Express"]),
+    ("Flask", "Framework", [r"flask", r"werkzeug"]),
 ]
 
 # (waf/cdn name, [match strings looked for in header names/values/server])
+# Entries are unique by signal: "AWS CloudFront / ELB" owns x-amz-cf-id,
+# so there is no second CloudFront entry firing on the same header.
 WAF_SIGNATURES = [
     ("Cloudflare", ["cf-ray", "cf-cache-status", "__cf_bm", "cloudflare"]),
     ("AWS CloudFront / ELB", ["x-amz-cf-id", "x-amzn-", "awselb", "cloudfront"]),
@@ -50,7 +60,6 @@ WAF_SIGNATURES = [
     ("Sucuri", ["x-sucuri", "sucuri"]),
     ("Imperva Incapsula", ["x-iinfo", "incap_ses", "incapsula", "imperva"]),
     ("Fastly", ["x-fastly", "fastly"]),
-    ("CloudFront", ["x-amz-cf-id"]),
     ("Varnish", ["varnish", "x-varnish"]),
     ("F5 BIG-IP", ["bigipserver", "f5-"]),
 ]
@@ -138,13 +147,13 @@ def _detect_from_body(body):
     return found, generator_name
 
 
-def _favicon_md5(target_url):
+def _favicon_md5(target_url, ctx):
     """Fetch /favicon.ico and return its MD5 hex digest, or None."""
     try:
         parts = urllib.parse.urlsplit(target_url)
         base = "%s://%s" % (parts.scheme or "https", parts.netloc)
         status, _headers, body, _final = fetch(
-            base + "/favicon.ico", timeout=FETCH_TIMEOUT
+            base + "/favicon.ico", timeout=_mod.timeout(ctx), ctx=ctx
         )
     except Exception:
         return None
@@ -161,14 +170,8 @@ def _favicon_md5(target_url):
 def run(target, ctx):
     findings = []
 
-    log = getattr(ctx, "log", None)
-
     def _log(level, message):
-        try:
-            if log is not None:
-                getattr(log, level)(message)
-        except Exception:
-            pass
+        _mod.log(ctx, level, message)
 
     url = (target or "").strip()
     if not url:
@@ -178,7 +181,8 @@ def run(target, ctx):
         url = "https://" + url
 
     try:
-        status, headers, body, final_url = fetch(url, timeout=FETCH_TIMEOUT)
+        status, headers, body, final_url = fetch(
+            url, timeout=_mod.timeout(ctx), ctx=ctx)
     except Exception as exc:
         _log("warning", "tech: fetch failed for %s: %s" % (url, exc))
         return findings
@@ -262,7 +266,7 @@ def run(target, ctx):
         )
 
     # 4. favicon hash (matchable against known-technology hash databases)
-    favicon_hash = _favicon_md5(url)
+    favicon_hash = _favicon_md5(url, ctx)
     if favicon_hash:
         findings.append(
             make_finding(

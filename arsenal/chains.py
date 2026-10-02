@@ -1,15 +1,30 @@
 """Chain suggester: combine individual findings into attack chains.
 
-suggest_chains(findings) matches findings on module/title/description
-keywords and returns ranked chain dicts:
+suggest_chains(findings) matches findings on STRUCTURED fields
+(module, kind, param, host, url) first and only falls back to title
+keywords where no structured signal exists. Returns ranked chain dicts:
     {"name", "severity", "findings": [titles], "reasoning", "next_steps"}
 """
 
 _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
 
+def _sig(finding):
+    """Structured signals for one finding."""
+    module = str(finding.get("module") or "").lower()
+    kind = str(finding.get("kind") or finding.get("vuln_class") or "").lower()
+    param = str(finding.get("param") or finding.get("parameter") or "").lower()
+    host = str(finding.get("host") or finding.get("target") or "").lower()
+    url = str(finding.get("url") or finding.get("location") or "").lower()
+    title = str(finding.get("title") or "").lower()
+    desc = str(finding.get("description") or "").lower()
+    evidence = str(finding.get("evidence") or "").lower()
+    return {"module": module, "kind": kind, "param": param, "host": host,
+            "url": url, "title": title, "desc": desc, "evidence": evidence}
+
+
 def _text(finding):
-    """Lowercased searchable text for one finding."""
+    """Lowercased searchable text for one finding (fallback signal)."""
     parts = [
         finding.get("module", ""),
         finding.get("title", ""),
@@ -19,8 +34,20 @@ def _text(finding):
     return " ".join(str(p) for p in parts).lower()
 
 
+def _by_module(findings, *modules):
+    """Findings whose module is one of the given names (structured)."""
+    wanted = {m.lower() for m in modules}
+    return [f for f in findings if _sig(f)["module"] in wanted]
+
+
+def _by_kind(findings, *kinds):
+    """Findings whose kind/vuln_class matches (structured)."""
+    wanted = {k.lower() for k in kinds}
+    return [f for f in findings if _sig(f)["kind"] in wanted]
+
+
 def _any(findings, *keywords):
-    """Findings whose text contains any of the keywords."""
+    """Findings whose text contains any of the keywords (fallback)."""
     return [f for f in findings if any(k in _text(f) for k in keywords)]
 
 
@@ -48,8 +75,12 @@ def suggest_chains(findings):
     chains = []
 
     # 1. Open redirect + OAuth issue -> OAuth redirect theft -> ATO
-    redirects = _any(findings, "open redirect", "redirect")
-    oauth = _any(findings, "oauth", "openid connect", "openid")
+    redirects = _by_module(findings, "redirect")
+    if not redirects:
+        redirects = _any(findings, "open redirect")
+    oauth = _by_module(findings, "oauth")
+    if not oauth:
+        oauth = _any(findings, "oauth", "openid connect", "openid")
     if redirects and oauth:
         matched = redirects + [f for f in oauth if f not in redirects]
         chains.append(_chain(
@@ -68,11 +99,15 @@ def suggest_chains(findings):
         ))
 
     # 2. Reflected XSS + admin panel hint -> XSS to admin session theft
-    rxss = _any(findings, "reflected xss", "reflected cross-site scripting")
+    rxss = _by_kind(findings, "reflected-xss", "xss-reflected")
     if not rxss:
-        rxss = [f for f in _any(findings, "xss", "cross-site scripting")
-                if "reflected" in _text(f)]
-    admin = _any(findings, "admin panel", "admin", "dashboard", "/wp-admin", "administrator")
+        rxss = [f for f in _by_module(findings, "xss")
+                if "reflected" in _sig(f)["kind"] or "reflected" in _text(f)]
+    admin = [f for f in findings
+             if any(t in _sig(f)["url"] for t in ("/wp-admin", "/admin", "/dashboard"))
+             or "admin" in _sig(f)["kind"]]
+    if not admin:
+        admin = _any(findings, "admin panel", "administrator")
     if rxss and admin:
         matched = rxss + [f for f in admin if f not in rxss]
         chains.append(_chain(
@@ -91,9 +126,13 @@ def suggest_chains(findings):
         ))
 
     # 3. SQLi + verbose errors -> error-based SQLi to full DB extraction
-    sqli = _any(findings, "sql injection", "sqli")
-    errors = _any(findings, "verbose error", "stack trace", "sql error",
-                  "database error", "debug mode", "detailed error")
+    sqli = _by_module(findings, "sqli")
+    if not sqli:
+        sqli = _any(findings, "sql injection", "sqli")
+    errors = _by_kind(findings, "verbose-error", "stack-trace", "debug-mode")
+    if not errors:
+        errors = _any(findings, "verbose error", "stack trace", "sql error",
+                      "database error", "debug mode", "detailed error")
     if sqli and errors:
         matched = sqli + [f for f in errors if f not in sqli]
         chains.append(_chain(
@@ -112,8 +151,13 @@ def suggest_chains(findings):
         ))
 
     # 4. CORS misconfig + API endpoints (jsintel) -> cross-origin API data theft
-    cors = _any(findings, "cors", "access-control-allow-origin")
-    apis = _any(findings, "api endpoint", "api endpoints", "jsintel", "rest api")
+    cors = _by_module(findings, "cors")
+    if not cors:
+        cors = _any(findings, "cors", "access-control-allow-origin")
+    apis = _by_module(findings, "jsintel")
+    apis = [f for f in apis if "api" in _sig(f)["kind"] or "api" in _text(f)]
+    if not apis:
+        apis = _any(findings, "api endpoint", "api endpoints", "rest api")
     if cors and apis:
         matched = cors + [f for f in apis if f not in cors]
         chains.append(_chain(
@@ -133,8 +177,14 @@ def suggest_chains(findings):
         ))
 
     # 5. Subdomain takeover + login/cookie scope -> session theft via takeover
-    takeover = _any(findings, "subdomain takeover", "takeover")
-    session_scope = _any(findings, "login", "cookie", "session")
+    takeover = _by_kind(findings, "subdomain-takeover", "takeover")
+    if not takeover:
+        takeover = _any(findings, "subdomain takeover", "takeover")
+    session_scope = [f for f in findings
+                     if _sig(f)["kind"] in ("login-page", "cookie-scope")
+                     or "/login" in _sig(f)["url"]]
+    if not session_scope:
+        session_scope = _any(findings, "login", "cookie", "session")
     if takeover and session_scope:
         matched = takeover + [f for f in session_scope if f not in takeover]
         chains.append(_chain(
@@ -155,10 +205,17 @@ def suggest_chains(findings):
         ))
 
     # 6. Exposed .env/git + secrets -> credential compromise chain
-    exposed = _any(findings, ".env", ".git", "exposed", "git repository",
-                   "directory listing")
-    secrets = _any(findings, "secret", "api key", "password", "token",
-                   "credential", "private key")
+    exposed = _by_module(findings, "wordlist", "secrets", "jssecrets")
+    exposed = [f for f in exposed
+               if any(t in _sig(f)["url"] for t in ("/.env", "/.git"))
+               or _sig(f)["kind"] in ("exposed-file", "exposed-git")]
+    if not exposed:
+        exposed = _any(findings, ".env", ".git", "exposed", "git repository",
+                       "directory listing")
+    secrets = _by_module(findings, "secrets", "jssecrets")
+    if not secrets:
+        secrets = _any(findings, "secret", "api key", "password", "token",
+                       "credential", "private key")
     if exposed and secrets:
         matched = exposed + [f for f in secrets if f not in exposed]
         chains.append(_chain(

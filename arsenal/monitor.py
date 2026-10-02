@@ -25,14 +25,12 @@ import json
 import os
 import re
 import socket
-import urllib.request
-import urllib.error
 from datetime import datetime
+
+from arsenal import http as http_lib
 
 COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 993, 995,
                 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017]
-
-_UA = {"User-Agent": "PentrixArsenal/1.0 (monitor)"}
 
 _JS_SECRET_PATTERNS = [
     ("aws_key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -74,27 +72,19 @@ def _scope_hosts(ctx, target) -> list:
 # Collectors
 # --------------------------------------------------------------------------
 
-def _fetch(url: str, timeout: int = 10):
-    """Return (status, headers dict, text) or (None, {}, "")."""
+def _fetch(url: str, timeout: int = 10, ctx=None):
+    """Return (status, headers dict, text) or (None, {}, "").
+
+    Thin wrapper over arsenal.http so the monitor honors the shared
+    stealth, proxy and retry settings instead of rolling its own client.
+    """
     try:
-        req = urllib.request.Request(url, headers=_UA)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(1_500_000)
-            headers = {k.lower(): v for k, v in resp.headers.items()}
-            status = resp.status
-    except urllib.error.HTTPError as exc:
-        try:
-            raw = exc.read(200_000)
-        except Exception:
-            raw = b""
-        headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
-        status = exc.code
+        status, headers, text, _final = http_lib.fetch_text(
+            url, timeout=timeout, ctx=ctx)
     except Exception:
         return None, {}, ""
-    try:
-        text = raw.decode("utf-8", errors="replace")
-    except Exception:
-        text = ""
+    if not status:
+        return None, {}, ""
     return status, headers, text
 
 
@@ -141,8 +131,8 @@ def _scan_ports(host: str, ports=None, timeout: float = 1.0) -> list:
     return sorted(open_ports)
 
 
-def _quick_tech(base_url: str) -> dict:
-    status, headers, text = _fetch(base_url, timeout=10)
+def _quick_tech(base_url: str, ctx=None) -> dict:
+    status, headers, text = _fetch(base_url, timeout=10, ctx=ctx)
     tech = {}
     if status is None:
         return tech
@@ -178,13 +168,13 @@ def _scan_js_secrets(js_text: str) -> list:
     return sorted(set(found))
 
 
-def _exposed(base_url: str):
+def _exposed(base_url: str, ctx=None):
     """Check /.git/HEAD and /.env exposure. Returns dict."""
     out = {"git": False, "env": False}
-    status, _h, text = _fetch(base_url.rstrip("/") + "/.git/HEAD", timeout=8)
+    status, _h, text = _fetch(base_url.rstrip("/") + "/.git/HEAD", timeout=8, ctx=ctx)
     if status == 200 and text.strip().startswith("ref:"):
         out["git"] = True
-    status, _h, text = _fetch(base_url.rstrip("/") + "/.env", timeout=8)
+    status, _h, text = _fetch(base_url.rstrip("/") + "/.env", timeout=8, ctx=ctx)
     if status == 200 and re.search(r"(?m)^[A-Z_]{2,}\s*=", text):
         out["env"] = True
     return out
@@ -237,10 +227,10 @@ def _collect_state(target, ctx) -> dict:
         # Web collectors against http and https
         for scheme in ("https", "http"):
             base = "%s://%s" % (scheme, host)
-            status, _h, text = _fetch(base, timeout=8)
+            status, _h, text = _fetch(base, timeout=8, ctx=ctx)
             if status is None:
                 continue
-            tech = _quick_tech(base)
+            tech = _quick_tech(base, ctx)
             mod_tech = _try_module("tech", host, ctx)
             if isinstance(mod_tech, dict):
                 tech.update({k: str(v) for k, v in mod_tech.items()})
@@ -248,13 +238,13 @@ def _collect_state(target, ctx) -> dict:
             if _is_login_page(text) and host not in state["login_hosts"]:
                 state["login_hosts"].append(host)
             for js_url in _js_urls(text, base):
-                _st, _hh, js_text = _fetch(js_url, timeout=10)
+                _st, _hh, js_text = _fetch(js_url, timeout=10, ctx=ctx)
                 if _st is None:
                     continue
                 digest = hashlib.sha256(js_text.encode("utf-8", errors="replace")).hexdigest()
                 state["js_hashes"][js_url] = digest
                 state["js_secrets"][js_url] = _scan_js_secrets(js_text)
-            exp = _exposed(base)
+            exp = _exposed(base, ctx)
             prev = state["exposed"].get(host, {"git": False, "env": False})
             state["exposed"][host] = {"git": prev["git"] or exp["git"],
                                       "env": prev["env"] or exp["env"]}
@@ -306,7 +296,7 @@ def evaluate(baseline: dict, current: dict, fetch=None) -> tuple:
     *fetch* is an injectable (status, headers, text) fetcher used by tests;
     defaults to the real HTTP fetcher.
     """
-    fetch = fetch or _fetch
+    fetch = fetch or (lambda url: _fetch(url, ctx=None))
     diff = {
         "ts": current.get("ts"),
         "added_subdomains": [],
@@ -319,9 +309,8 @@ def evaluate(baseline: dict, current: dict, fetch=None) -> tuple:
         "visual_changes": [],
     }
     findings = []
-    target = ""
 
-    base_subs = set(baseline.get("subdomains", []) or [])
+    base_subs= set(baseline.get("subdomains", []) or [])
     cur_subs = set(current.get("subdomains", []) or [])
     added = sorted(cur_subs - base_subs)
     removed = sorted(base_subs - cur_subs)

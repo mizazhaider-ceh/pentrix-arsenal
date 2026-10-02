@@ -1,0 +1,37 @@
+name: api-hunt
+description: >-
+  API-focused hunt: discover endpoints from JavaScript and tech signals,
+  then probe GraphQL, auth, and parameter handling. Skips auth-heavy
+  modules when no API surface was found.
+vars:
+  target: ""
+steps:
+  - module: jsintel
+    target: $target
+    args: {}
+  - module: tech
+    target: $target
+    args: {}
+  # GraphQL checks only fire when jsintel/tech actually saw a GraphQL hint.
+  - module: graphql
+    target: $target
+    args: {}
+    if: "findings > 0"
+  - parallel:
+      - module: fuzz
+        target: $target
+        args: {}
+      - module: paramminer
+        target: $target
+        args: {}
+      - module: headers
+        target: $target
+        args: {}
+  - module: jwt
+    target: $target
+    args: {}
+    if: "findings > 2"
+  - module: oauth
+    target: $target
+    args: {}
+    if: "findings > 2"

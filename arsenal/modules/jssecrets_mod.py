@@ -15,11 +15,11 @@ remediation.
 """
 
 import re
-from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-from arsenal.http import fetch
-from arsenal.findings import make_finding
+from arsenal.modules import jscrawl
+from arsenal.modules import secret_rules
+from arsenal.modules.base import BaseModule
 
 NAME = "jssecrets"
 DESCRIPTION = (
@@ -35,184 +35,18 @@ MAX_JS_BYTES = 500 * 1024
 MAX_MATCHES_PER_FILE = 25
 TIMEOUT = 10
 
-COMMON_JS_PATHS = ["/app.js", "/main.js", "/bundle.js"]
+# Shared helpers: secret rules come from the single canonical table in
+# arsenal.modules.secret_rules, JS discovery from arsenal.modules.jscrawl.
+_mod = BaseModule(NAME, TIMEOUT)
+_log = _mod.log_msg
+_finding = _mod.finding
 
-# Detection rules: (rule name, compiled pattern, severity, CWE).
-# Rule patterns adapted from pentrix-secrets; the JWT rule is added here
-# because token literals are common in client-side bundles.
-RULES = [
-    (
-        "AWS Access Key ID",
-        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-        "high",
-        "CWE-798",
-    ),
-    (
-        "AWS Secret Key Assignment",
-        re.compile(
-            r"(?i)\baws[_-]?secret[_-]?access[_-]?key\b\s*[:=]\s*"
-            r"['\"]?([A-Za-z0-9/+=]{30,})['\"]?"
-        ),
-        "high",
-        "CWE-798",
-    ),
-    (
-        "Private Key Block",
-        re.compile(r"-----BEGIN (?:[A-Z ]*)PRIVATE KEY-----"),
-        "high",
-        "CWE-798",
-    ),
-    (
-        "GitHub Token",
-        re.compile(
-            r"\b(ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|"
-            r"github_pat_[A-Za-z0-9_]{20,})\b"
-        ),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "GitLab Token",
-        re.compile(r"\bglpat-[A-Za-z0-9_\-]{16,}\b"),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "Slack Token",
-        re.compile(r"\bxox[bap]-[A-Za-z0-9-]{10,}\b"),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "Google API Key",
-        re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "Stripe Secret Key",
-        re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{10,}\b"),
-        "medium",
-        "CWE-798",
-    ),
-    (
-        "JWT Token",
-        re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "Generic API Key Assignment",
-        re.compile(
-            r"(?i)\b(?:api[_-]?key|apikey|api[_-]?secret|secret)\b\s*[:=]\s*"
-            r"['\"][^'\"]{4,}['\"]"
-        ),
-        "medium",
-        "CWE-798",
-    ),
-]
-
-
-# ---------------------------------------------------------------------------
-# Small internal helpers
-# ---------------------------------------------------------------------------
-class _ScriptSrcParser(HTMLParser):
-    """Collects script src attributes from a page."""
-
-    def __init__(self):
-        super().__init__()
-        self.srcs = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() == "script":
-            for attr_name, value in attrs:
-                if attr_name.lower() == "src" and value:
-                    self.srcs.append(value)
-
-
-def _log(ctx, message):
-    log = getattr(ctx, "log", None)
-    if callable(log):
-        try:
-            log(message)
-        except Exception:
-            pass
-
-
-def _redact(text):
-    """Mask a secret, keeping only a hint of its shape."""
-    text = text.strip()
-    if len(text) <= 8:
-        return "***REDACTED***"
-    return "%s...%s" % (text[:4], text[-2:])
-
-
-def _make_finding(**fields):
-    try:
-        return make_finding(**fields)
-    except Exception:
-        return dict(fields)
-
-
-def _http_get(url, timeout=TIMEOUT, max_bytes=None):
-    """GET url. Returns (status, body text) via the canonical fetch()."""
-    try:
-        status, _headers, body, _final = fetch(url, timeout=timeout)
-    except Exception:
-        return None, ""
-    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-    if max_bytes:
-        text = text[:max_bytes]
-    return status, text
-
-
-def _http_text(url, timeout=TIMEOUT):
-    status, text = _http_get(url, timeout=timeout)
-    if not status or status >= 400:
-        return ""
-    return text
+RULES = secret_rules.RULES
 
 
 # ---------------------------------------------------------------------------
 # Discovery and scanning
 # ---------------------------------------------------------------------------
-def _discover_js_urls(page_url, html):
-    """Return ordered, deduplicated same-host JS URLs for a page."""
-    found = []
-    seen = set()
-    base_netloc = urlparse(page_url).netloc.lower()
-
-    def add(raw):
-        if not raw or raw.startswith(("data:", "javascript:", "#")):
-            return
-        abs_url = urljoin(page_url, raw.strip())
-        parts = urlparse(abs_url)
-        if parts.scheme not in ("http", "https"):
-            return
-        if parts.netloc.lower() != base_netloc:
-            return
-        clean = parts._replace(fragment="").geturl()
-        if clean not in seen:
-            seen.add(clean)
-            found.append(clean)
-
-    parser = _ScriptSrcParser()
-    try:
-        parser.feed(html)
-    except Exception:
-        pass
-    for src in parser.srcs:
-        add(src)
-    # Fallback regex for unusual markup the parser may miss.
-    for match in re.finditer(
-        r"<script[^>]+src\s*=\s*[\"']([^\"']+)[\"']", html, re.IGNORECASE
-    ):
-        add(match.group(1))
-    for path in COMMON_JS_PATHS:
-        add(path)
-    return found
-
-
 def _safe_js_name(url, index):
     name = urlparse(url).path.rsplit("/", 1)[-1] or ("script-%d.js" % index)
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
@@ -234,24 +68,8 @@ def _save_js(ctx, target, url, index, content):
 
 
 def _scan_content(url, content):
-    """Scan JS text line by line. Returns a list of match dicts."""
-    matches = []
-    for lineno, line in enumerate(content.splitlines(), start=1):
-        for rule_name, pattern, severity, cwe in RULES:
-            for match in pattern.finditer(line):
-                snippet = match.group(0).strip()
-                matches.append(
-                    {
-                        "rule": rule_name,
-                        "severity": severity,
-                        "cwe": cwe,
-                        "line": lineno,
-                        "snippet": snippet,
-                    }
-                )
-                if len(matches) >= MAX_MATCHES_PER_FILE:
-                    return matches
-    return matches
+    """Scan JS text against the shared secret_rules table."""
+    return secret_rules.scan_text(content, max_matches=MAX_MATCHES_PER_FILE)
 
 
 def _build_finding(target, url, match):
@@ -267,7 +85,7 @@ def _build_finding(target, url, match):
         url,
         match["line"],
         rule,
-        _redact(match["snippet"]),
+        secret_rules.redact(match["snippet"]),
     )
     remediation = (
         "Rotate or revoke the exposed credential immediately and check access "
@@ -275,7 +93,7 @@ def _build_finding(target, url, match):
         "privileged calls behind a server-side proxy and ship only public, "
         "low-risk keys to the browser."
     )
-    return _make_finding(
+    return _finding(
         module=NAME,
         target=target,
         severity=match["severity"],
@@ -293,16 +111,17 @@ def _build_finding(target, url, match):
 # ---------------------------------------------------------------------------
 def _run(target, ctx):
     findings = []
-    html = _http_text(target, timeout=TIMEOUT)
+    html = jscrawl.fetch_page_text(target, ctx, timeout=TIMEOUT)
     if not html:
         _log(ctx, "jssecrets: could not fetch page %s" % target)
         return findings
 
-    js_urls = _discover_js_urls(target, html)[:MAX_JS_FILES]
+    js_urls = jscrawl.discover_js_urls(target, html)[:MAX_JS_FILES]
     _log(ctx, "jssecrets: discovered %d JS file(s) for %s" % (len(js_urls), target))
 
     for index, js_url in enumerate(js_urls):
-        status, body = _http_get(js_url, timeout=TIMEOUT, max_bytes=MAX_JS_BYTES)
+        status, body = jscrawl.fetch_js(js_url, ctx, timeout=TIMEOUT,
+                                          max_bytes=MAX_JS_BYTES)
         if status != 200 or not body:
             continue
         body = body[:MAX_JS_BYTES]

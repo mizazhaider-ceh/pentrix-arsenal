@@ -8,7 +8,6 @@ matching module, then stop with Ctrl+C.
 Library code in this module never prints; only ``dispatch`` prints.
 """
 
-import argparse
 import base64
 import json
 import re
@@ -311,6 +310,123 @@ class OAuthFixtureHandler(QuietHandler, BaseHTTPRequestHandler):
                         "login with lab-oauth</a></body></html>")
 
 
+class TechFixtureHandler(QuietHandler, BaseHTTPRequestHandler):
+    """8011: technology markers - Werkzeug server banner, Express
+    X-Powered-By, jQuery + GraphQL markers in HTML, CloudFront header."""
+
+    def version_string(self):
+        return "Werkzeug/2.3.7"
+
+    def do_GET(self):
+        body = ("<html><head>"
+                '<script src="/static/jquery-3.7.1.min.js"></script>'
+                "</head><body><h1>Shop</h1>"
+                '<a href="/graphql">API</a>'
+                "</body></html>")
+        _send(self, body, extra_headers={
+            "X-Powered-By": "Express",
+            "X-Amz-Cf-Id": "lab-cf-id-123",
+        })
+
+
+class FuzzFixtureHandler(QuietHandler, BaseHTTPRequestHandler):
+    """8012: /probe?x= reflects x and evaluates {{7*7}} to 49."""
+
+    def do_GET(self):
+        route, query = _parse_path(self)
+        if route == "/probe":
+            x = query.get("x", ["1"])[0]
+            rendered = x.replace("{{7*7}}", "49")
+            body = ("<html><body><p>probe result: " + rendered +
+                    "</p></body></html>")
+            _send(self, body)
+        else:
+            _send(self, "<html><body><a href='/probe?x=1'>probe</a>"
+                        "</body></html>")
+
+
+class ParamminerFixtureHandler(QuietHandler, BaseHTTPRequestHandler):
+    """8013: /page changes when a hidden 'debug' parameter is present."""
+
+    def do_GET(self):
+        route, query = _parse_path(self)
+        if route == "/page":
+            if "debug" in query:
+                # A realistically verbose debug dump: well over the
+                # module's length-delta threshold versus the baseline.
+                lines = ["<html><body><h1>Page</h1>", "<p>debug mode on</p>",
+                         "<pre>"]
+                for i in range(40):
+                    lines.append("debug trace line %d: handler=page "
+                                 "state=verbose-ok\n" % i)
+                lines.append("</pre></body></html>")
+                _send(self, "".join(lines))
+            else:
+                _send(self, "<html><body><h1>Page</h1>"
+                            "<p>normal content</p></body></html>")
+        else:
+            _send(self, "<html><body><a href='/page'>page</a></body></html>")
+
+
+class HostheaderFixtureHandler(QuietHandler, BaseHTTPRequestHandler):
+    """8014: / reflects the Host header value into the body."""
+
+    def do_GET(self):
+        host = self.headers.get("Host", "")
+        body = ("<html><body><h1>Welcome</h1>"
+                "<p>You reached host: " + host + "</p></body></html>")
+        _send(self, body)
+
+
+class JSIntelFixtureHandler(QuietHandler, BaseHTTPRequestHandler):
+    """8015: / loads /app.js which calls /api/v1/users; the endpoint
+    returns JSON holding an email address (a sensitivity signal)."""
+
+    def do_GET(self):
+        route, _ = _parse_path(self)
+        if route == "/app.js":
+            js = ('// app bundle\n'
+                  'fetch("/api/v1/users").then(r => r.json());\n')
+            _send(self, js, content_type="application/javascript")
+        elif route == "/api/v1/users":
+            _send(self, '[{"id": 1, "email": "admin@lab.local"}]',
+                  content_type="application/json")
+        else:
+            _send(self, "<html><head><script src='/app.js'></script></head>"
+                        "<body><h1>Users app</h1></body></html>")
+
+
+class NVDMockFixtureHandler(QuietHandler, BaseHTTPRequestHandler):
+    """8016: minimal NVD 2.0-shaped response for offline cve tests."""
+
+    _CVE = {
+        "id": "CVE-2026-0001",
+        "published": "2026-01-15T00:00:00.000",
+        "descriptions": [
+            {"lang": "en",
+             "value": "Lab fixture vulnerability used for offline testing."}
+        ],
+        "metrics": {
+            "cvssMetricV31": [
+                {"cvssData": {"version": "3.1", "baseScore": 7.5},
+                 "source": "lab"}
+            ]
+        },
+        "references": [{"url": "https://example.com/lab"}],
+        "weaknesses": [{"description": [{"lang": "en", "value": "CWE-79"}]}],
+    }
+
+    def do_GET(self):
+        route, _ = _parse_path(self)
+        if route.startswith("/rest/json/cves/2.0"):
+            _send(self, json.dumps(
+                {"vulnerabilities": [{"cve": self._CVE}]}),
+                content_type="application/json")
+        else:
+            _send(self, "not found", status=404,
+                   content_type="text/plain; charset=utf-8")
+
+
 # name -> (port, handler class, example path, description)
 FIXTURES = {
     "xss": (8001, XSSFixtureHandler, "/search?q=<payload>",
@@ -334,6 +450,18 @@ FIXTURES = {
     "oauth": (8010, OAuthFixtureHandler,
               "/oauth/authorize?redirect_uri=https://client.example/cb",
               "OAuth: redirect_uri is not validated"),
+    "tech": (8011, TechFixtureHandler, "/",
+             "Tech: Werkzeug banner, Express, jQuery, GraphQL, CloudFront"),
+    "fuzz": (8012, FuzzFixtureHandler, "/probe?x=1",
+             "Fuzz: x is reflected, {{7*7}} evaluates to 49"),
+    "paramminer": (8013, ParamminerFixtureHandler, "/page",
+                   "Paramminer: hidden 'debug' parameter changes the page"),
+    "hostheader": (8014, HostheaderFixtureHandler, "/",
+                   "Host header: Host value reflected in the body"),
+    "jsintel": (8015, JSIntelFixtureHandler, "/api/v1/users",
+                "JS intel: /app.js calls /api/v1/users (email in JSON)"),
+    "cve": (8016, NVDMockFixtureHandler, "/rest/json/cves/2.0",
+            "CVE: mock NVD 2.0 response (offline testing)"),
 }
 
 
@@ -404,6 +532,233 @@ def _wait_up(port, timeout=5.0):
         except OSError:
             time.sleep(0.05)
     raise RuntimeError("lab fixture on port %d did not start" % port)
+
+
+class BannerTCPServer:
+    """Minimal raw-TCP server that sends a banner per connection.
+
+    Used for the portscan check (portscan speaks raw TCP, not HTTP, so it
+    cannot use the HTTP fixtures above).
+    """
+
+    def __init__(self, banner=b"SSH-2.0-OpenSSH_lab\r\n"):
+        self.banner = banner
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(5)
+        self._sock.settimeout(0.5)
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True,
+                                        name="lab-tcp-banner")
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            try:
+                conn.sendall(self.banner)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def start(self):
+        self._thread.start()
+        _wait_up(self.port)
+        return self
+
+    def stop(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# Automated harness: start fixture, run matching module, assert a finding.
+#
+# run_check(name) starts only the fixture(s) a check needs, runs the module
+# through the defensive pipeline.run_module() wrapper, and asserts the
+# expected finding shows up. run_all_checks() runs every check and returns
+# a {name: (ok, detail)} mapping. The pytest suite in tests/ drives this.
+# ---------------------------------------------------------------------------
+
+def make_lab_ctx(**overrides):
+    """Ctx for lab checks: short timeouts, intrusive modules allowed."""
+    from arsenal.context import make_ctx
+    config = {"timeout": 5}
+    config.update(overrides.pop("config", {}) or {})
+    return make_ctx(config=config, safe_mode=False, allow_intrusive=True,
+                    **overrides)
+
+
+def _check_target_local_hashes():
+    import os
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="lab-hashes-", suffix=".txt")
+    with os.fdopen(fd, "w") as fh:
+        fh.write("5d41402abc4b2a76b9719d911017c592\n")
+    return path
+
+
+def _check_target_local_secrets():
+    import os
+    import tempfile
+    directory = tempfile.mkdtemp(prefix="lab-secrets-")
+    with open(os.path.join(directory, "config.py"), "w") as fh:
+        fh.write('AWS_KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+    return directory
+
+
+# check name -> spec. fixture names refer to FIXTURES; target may contain
+# {port}. min_findings and title_contains drive the assertion.
+CHECKS = {
+    "xss": {"fixture": "xss", "module": "xss",
+            "target": "http://127.0.0.1:{port}/search?q=test",
+            "min_findings": 1, "title_contains": "Reflected XSS"},
+    "sqli": {"fixture": "sqli", "module": "sqli",
+             "target": "http://127.0.0.1:{port}/item?id=1",
+             "min_findings": 1, "title_contains": "SQL injection"},
+    "headers": {"fixture": "headers", "module": "headers",
+                "target": "http://127.0.0.1:{port}/",
+                "min_findings": 1,
+                "title_contains": "Strict-Transport-Security"},
+    "jwt": {"fixture": None, "module": "jwt",
+            "target": NONE_TOKEN,
+            "min_findings": 1, "title_contains": "none"},
+    "redirect": {"fixture": "redirect", "module": "redirect",
+                 "target": "http://127.0.0.1:{port}/go?url=https://example.com",
+                 "min_findings": 1, "title_contains": "Open redirect"},
+    "cors": {"fixture": "cors", "module": "cors",
+             "target": "http://127.0.0.1:{port}/api/data",
+             "min_findings": 1, "title_contains": "CORS"},
+    "ssti": {"fixture": "ssti", "module": "ssti",
+             "target": "http://127.0.0.1:{port}/hello?name=guest",
+             "min_findings": 1, "title_contains": "template injection"},
+    "jssecrets": {"fixture": "jssecrets", "module": "jssecrets",
+                  "target": "http://127.0.0.1:{port}/",
+                  "min_findings": 1, "title_contains": "AWS Access Key ID"},
+    "graphql": {"fixture": "graphql", "module": "graphql",
+                "target": "http://127.0.0.1:{port}/graphql",
+                "min_findings": 1, "title_contains": "introspection"},
+    "oauth": {"fixture": "oauth", "module": "oauth",
+              "target": "http://127.0.0.1:{port}/",
+              "min_findings": 1, "title_contains": "redirect_uri"},
+    "tech": {"fixture": "tech", "module": "tech",
+             "target": "http://127.0.0.1:{port}/",
+             "min_findings": 3, "title_contains": "GraphQL"},
+    "fuzz": {"fixture": "fuzz", "module": "fuzz",
+             "target": "http://127.0.0.1:{port}/probe?x=1",
+             "min_findings": 1, "title_contains": "Anomalous parameter"},
+    "paramminer": {"fixture": "paramminer", "module": "paramminer",
+                   "target": "http://127.0.0.1:{port}/page",
+                   "min_findings": 1, "title_contains": "debug"},
+    "hostheader": {"fixture": "hostheader", "module": "hostheader",
+                   "target": "http://127.0.0.1:{port}/",
+                   "min_findings": 1, "title_contains": "Host header"},
+    "jsintel": {"fixture": "jsintel", "module": "jsintel",
+                "target": "http://127.0.0.1:{port}/",
+                "min_findings": 1,
+                "title_contains": "Unauthenticated API endpoint"},
+    "portscan": {"fixture": "tcp-banner", "module": "portscan",
+                 "target": "127.0.0.1",
+                 "min_findings": 1, "title_contains": "Open port"},
+    "hashid": {"fixture": "local-file", "module": "hashid",
+               "target_builder": _check_target_local_hashes,
+               "min_findings": 1, "title_contains": "Hash identified"},
+    "phish": {"fixture": None, "module": "phish",
+              "target": "http://93.184.216.34@secure-login-verify-account.com/login",
+              "min_findings": 1, "title_contains": "Phishing indicator"},
+    "secrets": {"fixture": "local-dir", "module": "secrets",
+                "target_builder": _check_target_local_secrets,
+                "min_findings": 1, "title_contains": "AWS Access Key ID"},
+    "cve": {"fixture": "cve", "module": "cve",
+            "target": "lab-fixture",
+            "min_findings": 1, "title_contains": "CVE-2026-0001",
+            "patch_nvd_base": True},
+}
+
+
+def run_check(name, timeout=60):
+    """Run one lab check. Returns (ok: bool, detail: str). Never raises."""
+    from arsenal.pipeline import run_module
+    spec = CHECKS.get(name)
+    if spec is None:
+        return False, "unknown check: %r" % (name,)
+    servers = []
+    tcp_server = None
+    target = spec.get("target")
+    try:
+        fixture = spec.get("fixture")
+        if fixture == "tcp-banner":
+            tcp_server = BannerTCPServer().start()
+            target = "127.0.0.1"
+        elif fixture == "local-file":
+            target = _check_target_local_hashes()
+        elif fixture == "local-dir":
+            target = _check_target_local_secrets()
+        elif fixture:
+            port, handler, _example, _desc = FIXTURES[fixture]
+            server = LabServer(fixture, port, handler).start()
+            servers.append(server)
+            _wait_up(port)
+            target = (target or "").format(port=port)
+
+        if spec.get("target_builder"):
+            target = spec["target_builder"]()
+
+        ctx = make_lab_ctx()
+        if name == "portscan" and tcp_server is not None:
+            ctx.config["portscan_ports"] = [tcp_server.port]
+
+        mod = __import__("arsenal.modules.%s_mod" % spec["module"],
+                         fromlist=["*"])
+        saved_nvd_base = getattr(mod, "NVD_BASE", None)
+        if spec.get("patch_nvd_base"):
+            # Point the module at the mock NVD fixture instead of nvd.nist.gov.
+            port = FIXTURES["cve"][0]
+            mod.NVD_BASE = "http://127.0.0.1:%d/rest/json/cves/2.0" % port
+        result = run_module(mod, target, ctx)
+        if spec.get("patch_nvd_base"):
+            mod.NVD_BASE = saved_nvd_base
+        findings = result["findings"]
+        titles = [str(f.get("title", "")) for f in findings]
+        want = spec.get("title_contains", "")
+        matched = [t for t in titles if want.lower() in t.lower()]
+        if len(findings) >= spec.get("min_findings", 1) and matched:
+            return True, "%d finding(s), matched %r" % (len(findings),
+                                                        matched[0])
+        return False, ("expected >=%d findings with %r in the title, got %d: %s"
+                       % (spec.get("min_findings", 1), want, len(findings),
+                          titles[:3]))
+    except Exception as exc:
+        return False, "check raised: %s: %s" % (type(exc).__name__, exc)
+    finally:
+        for server in servers:
+            try:
+                server.stop()
+            except Exception:
+                pass
+        if tcp_server is not None:
+            try:
+                tcp_server.stop()
+            except Exception:
+                pass
+
+
+def run_all_checks():
+    """Run every check in CHECKS. Returns {name: (ok, detail)}."""
+    results = {}
+    for name in CHECKS:
+        results[name] = run_check(name)
+    return results
 
 
 _MANAGER = None

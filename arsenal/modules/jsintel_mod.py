@@ -18,11 +18,10 @@ remediation.
 
 import json
 import re
-from html.parser import HTMLParser
 from urllib.parse import parse_qsl, urljoin, urlparse
 
-from arsenal.http import fetch
-from arsenal.findings import make_finding
+from arsenal.modules import jscrawl
+from arsenal.modules.base import BaseModule
 
 NAME = "jsintel"
 DESCRIPTION = (
@@ -40,7 +39,13 @@ MAX_ENDPOINTS = 25
 MAX_PROBE_BYTES = 256 * 1024
 TIMEOUT = 10
 
-COMMON_JS_PATHS = ["/app.js", "/main.js", "/bundle.js"]
+# Shared helpers bound from arsenal.modules.base; JS discovery comes from
+# the shared arsenal.modules.jscrawl crawler (no local copies).
+_mod = BaseModule(NAME, TIMEOUT)
+_log = _mod.log_msg
+_finding = _mod.finding
+
+COMMON_JS_PATHS = jscrawl.COMMON_JS_PATHS
 
 # Quoted strings that look like API routes.
 _API_PATH_RE = re.compile(
@@ -66,94 +71,6 @@ _ERROR_RES = [
 
 # Path hints for debug or admin interfaces.
 _DEBUG_HINTS = ("/debug", "/console", "/admin", "/actuator", "/.env")
-
-
-# ---------------------------------------------------------------------------
-# Small internal helpers (copied from the jssecrets discovery logic)
-# ---------------------------------------------------------------------------
-class _ScriptSrcParser(HTMLParser):
-    """Collects script src attributes from a page."""
-
-    def __init__(self):
-        super().__init__()
-        self.srcs = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() == "script":
-            for attr_name, value in attrs:
-                if attr_name.lower() == "src" and value:
-                    self.srcs.append(value)
-
-
-def _log(ctx, message):
-    log = getattr(ctx, "log", None)
-    if callable(log):
-        try:
-            log(message)
-        except Exception:
-            pass
-
-
-def _make_finding(**fields):
-    try:
-        return make_finding(**fields)
-    except Exception:
-        return dict(fields)
-
-
-def _http_get(url, timeout=TIMEOUT, max_bytes=None):
-    """GET url. Returns (status, body text) via the canonical fetch()."""
-    try:
-        status, _headers, body, _final = fetch(url, timeout=timeout)
-    except Exception:
-        return None, ""
-    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-    if max_bytes:
-        text = text[:max_bytes]
-    return status, text
-
-
-def _http_text(url, timeout=TIMEOUT):
-    status, text = _http_get(url, timeout=timeout)
-    if not status or status >= 400:
-        return ""
-    return text
-
-
-def _discover_js_urls(page_url, html):
-    """Return ordered, deduplicated same-host JS URLs for a page."""
-    found = []
-    seen = set()
-    base_netloc = urlparse(page_url).netloc.lower()
-
-    def add(raw):
-        if not raw or raw.startswith(("data:", "javascript:", "#")):
-            return
-        abs_url = urljoin(page_url, raw.strip())
-        parts = urlparse(abs_url)
-        if parts.scheme not in ("http", "https"):
-            return
-        if parts.netloc.lower() != base_netloc:
-            return
-        clean = parts._replace(fragment="").geturl()
-        if clean not in seen:
-            seen.add(clean)
-            found.append(clean)
-
-    parser = _ScriptSrcParser()
-    try:
-        parser.feed(html)
-    except Exception:
-        pass
-    for src in parser.srcs:
-        add(src)
-    for match in re.finditer(
-        r"<script[^>]+src\s*=\s*[\"']([^\"']+)[\"']", html, re.IGNORECASE
-    ):
-        add(match.group(1))
-    for path in COMMON_JS_PATHS:
-        add(path)
-    return found
 
 
 # ---------------------------------------------------------------------------
@@ -252,14 +169,15 @@ def _excerpt(body, match=None, radius=160):
     return " ".join(snippet.split())
 
 
-def _build_unauth_finding(target, url, status, body, params, js_keys):
+def _build_unauth_finding(target, url, status, body, params, js_keys,
+                          signal):
     param_note = ""
     observed = list(params) + [k for k in js_keys if k not in params]
     if observed:
         param_note = " Parameter names observed in client code: %s." % ", ".join(
             observed[:10]
         )
-    return _make_finding(
+    return _finding(
         module=NAME,
         target=target,
         severity="medium",
@@ -267,9 +185,10 @@ def _build_unauth_finding(target, url, status, body, params, js_keys):
         title="Unauthenticated API endpoint",
         description=(
             "GET %s returned HTTP %d with a JSON body and no authentication "
-            "was required. The endpoint is reachable anonymously, so any "
-            "data it returns should be assumed public.%s"
-            % (url, status, param_note)
+            "was required. Sensitivity signal: %s. The endpoint is "
+            "reachable anonymously, so any data it returns should be "
+            "assumed public.%s"
+            % (url, status, signal, param_note)
         ),
         evidence="GET %s -> HTTP %d\nExcerpt: %s" % (url, status, _excerpt(body)),
         cwe="CWE-862",
@@ -282,7 +201,7 @@ def _build_unauth_finding(target, url, status, body, params, js_keys):
 
 
 def _build_verbose_error_finding(target, url, status, body, match):
-    return _make_finding(
+    return _finding(
         module=NAME,
         target=target,
         severity="medium",
@@ -305,7 +224,7 @@ def _build_verbose_error_finding(target, url, status, body, match):
 
 
 def _build_debug_finding(target, url, status, body):
-    return _make_finding(
+    return _finding(
         module=NAME,
         target=target,
         severity="high",
@@ -327,10 +246,45 @@ def _build_debug_finding(target, url, status, body):
     )
 
 
-def _probe_endpoint(target, url, js_keys):
+# A 200 + JSON response is only worth flagging as an unauthenticated API
+# when there is a sensitivity signal: data that looks personal/secret, or
+# a path that smells like an admin, account or state-changing surface.
+# Without a signal the endpoint is just a public API, which is normal.
+_PII_RE = re.compile(
+    r"(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|ssn|"
+    r"social.?security|credit.?card|card.?number|cvv|bank.?account|iban|"
+    r"phone|date.?of.?birth|\bdob\b|salary|passport|email)"
+)
+_SENSITIVE_PATH_HINTS = (
+    "/admin", "/users", "/user", "/account", "/profile", "/internal",
+    "/private", "/manage", "/payment", "/order", "/invoice", "/customer",
+    "/settings", "/config",
+)
+_STATE_CHANGING_HINTS = (
+    "/delete", "/update", "/create", "/edit", "/remove", "/reset",
+)
+
+
+def _sensitivity_signal(url, body):
+    """Return a human-readable reason the endpoint looks sensitive, or None."""
+    path = urlparse(url).path.lower()
+    for hint in _SENSITIVE_PATH_HINTS:
+        if hint in path:
+            return "sensitive path (%s)" % hint
+    for hint in _STATE_CHANGING_HINTS:
+        if hint in path:
+            return "state-changing path (%s)" % hint
+    match = _PII_RE.search(body[:65536] if isinstance(body, str) else "")
+    if match:
+        return "response mentions %r" % match.group(1).lower()
+    return None
+
+
+def _probe_endpoint(target, url, js_keys, ctx):
     """GET one endpoint without auth and classify the response."""
     findings = []
-    status, body = _http_get(url, timeout=TIMEOUT, max_bytes=MAX_PROBE_BYTES)
+    status, body = jscrawl.fetch_js(url, ctx, timeout=TIMEOUT,
+                                    max_bytes=MAX_PROBE_BYTES)
     if status is None:
         return findings
     body = body[:MAX_PROBE_BYTES]
@@ -347,9 +301,14 @@ def _probe_endpoint(target, url, js_keys):
         )
 
     if status == 200 and _looks_like_json(body):
+        signal = _sensitivity_signal(url, body)
+        if signal is None:
+            # Public JSON with no sensitivity signal: not a finding.
+            return findings
         findings.append(
             _build_unauth_finding(
-                target, url, status, body, _params_for_endpoint(url), js_keys
+                target, url, status, body, _params_for_endpoint(url), js_keys,
+                signal,
             )
         )
     return findings
@@ -368,20 +327,21 @@ def _run(target, ctx):
         )
         return findings
 
-    html = _http_text(target, timeout=TIMEOUT)
+    html = jscrawl.fetch_page_text(target, ctx, timeout=TIMEOUT)
     if not html:
         _log(ctx, "jsintel: could not fetch page %s" % target)
         return findings
 
     host = urlparse(target).netloc.lower()
-    js_urls = _discover_js_urls(target, html)[:MAX_JS_FILES]
+    js_urls = jscrawl.discover_js_urls(target, html)[:MAX_JS_FILES]
     _log(ctx, "jsintel: discovered %d JS file(s) for %s" % (len(js_urls), target))
 
     endpoints = []
     seen = set()
     js_keys = []
     for js_url in js_urls:
-        status, body = _http_get(js_url, timeout=TIMEOUT, max_bytes=MAX_JS_BYTES)
+        status, body = jscrawl.fetch_js(js_url, ctx, timeout=TIMEOUT,
+                                     max_bytes=MAX_JS_BYTES)
         if status != 200 or not body:
             continue
         body = body[:MAX_JS_BYTES]
@@ -403,7 +363,7 @@ def _run(target, ctx):
     )
     for endpoint in endpoints:
         try:
-            findings.extend(_probe_endpoint(target, endpoint, js_keys))
+            findings.extend(_probe_endpoint(target, endpoint, js_keys, ctx))
         except Exception as exc:
             _log(ctx, "jsintel: probe failed for %s: %s" % (endpoint, exc))
     return findings

@@ -2,7 +2,7 @@
 
 TARGET_KIND "url". Fetches the target homepage plus up to 10 same-host
 linked pages, extracts lowercased words (length 4 or more), and generates
-mutations: year suffixes 2019-2026, common suffixes (123, !, @, #), and
+mutations: year suffixes (current year back 7), common suffixes (123, !, @, #), and
 leet-speak variants of the most frequent words. The wordlist is saved to the
 workspace (or a local fallback file) and reported as an informational
 finding.
@@ -16,13 +16,14 @@ remediation.
 
 import html as html_module
 import os
+from datetime import datetime
 import re
 from collections import Counter
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
-from arsenal.http import fetch
-from arsenal.findings import make_finding
+from arsenal.modules import jscrawl
+from arsenal.modules.base import BaseModule
 
 NAME = "wordlist"
 DESCRIPTION = (
@@ -37,7 +38,13 @@ MAX_PAGE_BYTES = 200 * 1024
 MAX_WORDS = 5000
 TIMEOUT = 10
 
-YEARS = [str(year) for year in range(2019, 2027)]
+def _year_range(years_back=7):
+    """Year suffixes ending at the current year (no yearly rot)."""
+    current = datetime.now().year
+    return [str(year) for year in range(current - years_back, current + 1)]
+
+
+YEARS = _year_range()
 SUFFIXES = ["123", "!", "@", "#"]
 LEET_MAP = {
     "a": "4",
@@ -52,6 +59,10 @@ LEET_MAP = {
 }
 TOP_LEET_WORDS = 50
 MIN_WORD_LEN = 4
+
+_mod = BaseModule(NAME, TIMEOUT)
+_log = _mod.log_msg
+_finding = _mod.finding
 
 
 # ---------------------------------------------------------------------------
@@ -71,44 +82,7 @@ class _LinkParser(HTMLParser):
                     self.hrefs.append(value)
 
 
-def _log(ctx, message):
-    log = getattr(ctx, "log", None)
-    if callable(log):
-        try:
-            log(message)
-        except Exception:
-            pass
 
-
-def _make_finding(**fields):
-    try:
-        return make_finding(**fields)
-    except Exception:
-        return dict(fields)
-
-
-def _http_get(url, timeout=TIMEOUT, max_bytes=None):
-    """GET url. Returns (status, body text) via the canonical fetch()."""
-    try:
-        status, _headers, body, _final = fetch(url, timeout=timeout)
-    except Exception:
-        return None, ""
-    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-    if max_bytes:
-        text = text[:max_bytes]
-    return status, text
-
-
-def _http_text(url, timeout=TIMEOUT):
-    status, text = _http_get(url, timeout=timeout)
-    if not status or status >= 400:
-        return ""
-    return text
-
-
-# ---------------------------------------------------------------------------
-# Crawling and word extraction
-# ---------------------------------------------------------------------------
 def _discover_links(page_url, html):
     """Return ordered, deduplicated same-host page links."""
     found = []
@@ -213,7 +187,7 @@ def _save_wordlist(ctx, target, content):
 # ---------------------------------------------------------------------------
 def _run(target, ctx):
     findings = []
-    html = _http_text(target, timeout=TIMEOUT)
+    html = jscrawl.fetch_page_text(target, ctx, timeout=TIMEOUT)
     if not html:
         _log(ctx, "wordlist: could not fetch page %s" % target)
         return findings
@@ -225,7 +199,8 @@ def _run(target, ctx):
         "wordlist: fetching %d linked page(s) for %s" % (len(links), target),
     )
     for link in links:
-        status, body = _http_get(link, timeout=TIMEOUT, max_bytes=MAX_PAGE_BYTES)
+        status, body = jscrawl.fetch_js(link, ctx, timeout=TIMEOUT,
+                                          max_bytes=MAX_PAGE_BYTES)
         if status == 200 and body:
             pages.append(body[:MAX_PAGE_BYTES])
 
@@ -250,7 +225,7 @@ def _run(target, ctx):
         % (len(words), len(pages), target),
     )
     findings.append(
-        _make_finding(
+        _finding(
             module=NAME,
             target=target,
             severity="info",
@@ -258,9 +233,10 @@ def _run(target, ctx):
             title="Targeted wordlist generated from site content",
             description=(
                 "Crawled %d page(s) on %s, extracted %d unique words and "
-                "generated %d wordlist entries with year (2019-2026), suffix "
+                "generated %d wordlist entries with year (%s-%s), suffix "
                 "and leet mutations for authorized password testing."
-                % (len(pages), target, len(counter), len(words))
+                % (len(pages), target, len(counter), len(words),
+                   YEARS[0], YEARS[-1])
             ),
             evidence="wordlist path: %s | entries: %d" % (saved_path, len(words)),
             cwe="N/A",

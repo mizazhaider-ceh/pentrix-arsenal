@@ -1,0 +1,22 @@
+name: continuous-monitor
+description: >-
+  Continuous monitoring sweep: for each target, refresh subdomain/tech
+  state and check versioned tech against NVD. Designed to run on a
+  schedule (cron); findings accumulate in each target's workspace and
+  `arsenal trends` shows the drift week over week.
+vars:
+  targets: []
+for_each: targets
+steps:
+  - module: recon
+    target: $target
+    args: {}
+  - module: tech
+    target: $target
+    args: {}
+  # CVE lookup only earns its NVD calls when tech fingerprinting found
+  # something versioned to check.
+  - module: cve
+    target: $target
+    args: {}
+    if: "findings > 0"

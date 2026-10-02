@@ -104,6 +104,208 @@ def _sort_key(finding):
             str(finding.get("title", "")))
 
 
+# --------------------------------------------------------------------------
+# Remediation library (per-finding guidance with code samples)
+# --------------------------------------------------------------------------
+
+# module -> (summary, language, code sample)
+REMEDIATION = {
+    "xss": (
+        "Encode all untrusted data for its output context and deploy a strict "
+        "Content-Security-Policy. Never build HTML by string concatenation.",
+        "html",
+        "<!-- context-aware output encoding (example: Python/Jinja2) -->\n"
+        "<p>{{ user_input | e }}</p>\n\n"
+        "<!-- strict CSP header -->\n"
+        "Content-Security-Policy: default-src 'self'; script-src 'self';\n"
+        "  object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+    ),
+    "sqli": (
+        "Use parameterized queries or a vetted ORM everywhere. Never "
+        "interpolate user input into SQL strings.",
+        "python",
+        "# parameterized query (psycopg2)\n"
+        "cur.execute(\"SELECT * FROM users WHERE id = %s\", (user_id,))\n\n"
+        "# NEVER do this:\n"
+        "# cur.execute(\"SELECT * FROM users WHERE id = '%s'\" % user_id)",
+    ),
+    "ssti": (
+        "Never render templates from user-controlled strings. If templates "
+        "must be dynamic, use a logic-less sandbox with autoescaping.",
+        "python",
+        "# Jinja2 sandboxed environment\n"
+        "from jinja2.sandbox import SandboxedEnvironment\n"
+        "env = SandboxedEnvironment(autoescape=True)\n"
+        "template = env.from_string(TRUSTED_TEMPLATE)  # never user input",
+    ),
+    "cors": (
+        "Reflect only explicitly allowlisted origins, and never combine a "
+        "reflected origin with Access-Control-Allow-Credentials: true.",
+        "python",
+        "ALLOWED = {\"https://app.example.com\"}\n"
+        "origin = request.headers.get(\"Origin\")\n"
+        "if origin in ALLOWED:\n"
+        "    resp.headers[\"Access-Control-Allow-Origin\"] = origin\n"
+        "    resp.headers[\"Vary\"] = \"Origin\"",
+    ),
+    "headers": (
+        "Send a complete set of security headers on every response.",
+        "http",
+        "Strict-Transport-Security: max-age=31536000; includeSubDomains\n"
+        "Content-Security-Policy: default-src 'self'; object-src 'none';\n"
+        "  base-uri 'self'; frame-ancestors 'none'\n"
+        "X-Content-Type-Options: nosniff\n"
+        "Referrer-Policy: strict-origin-when-cross-origin\n"
+        "Permissions-Policy: camera=(), microphone=(), geolocation=()",
+    ),
+    "redirect": (
+        "Validate redirect targets against an allowlist of relative paths "
+        "or known hosts. Never redirect to a raw request parameter.",
+        "python",
+        "from urllib.parse import urlparse\n"
+        "target = request.args.get(\"next\", \"/\")\n"
+        "if urlparse(target).netloc:  # absolute URL -> reject\n"
+        "    target = \"/\"\n"
+        "return redirect(target)",
+    ),
+    "graphql": (
+        "Disable introspection in production, enforce query depth/cost "
+        "limits, and require authentication for sensitive fields.",
+        "javascript",
+        "// graphql-yoga / envelop style depth limiting\n"
+        "import { useDepthLimit } from '@envelop/depth-limit'\n"
+        "const getEnveloped = envelop({\n"
+        "  plugins: [useDepthLimit({ maxDepth: 7 })],\n"
+        "})\n"
+        "// introspection: false in production builds",
+    ),
+    "jwt": (
+        "Verify signatures server-side with a single trusted algorithm, "
+        "reject 'none', and keep token lifetimes short.",
+        "python",
+        "import jwt\n"
+        "payload = jwt.decode(token, PUBLIC_KEY, algorithms=[\"RS256\"],\n"
+        "                   options={\"require\": [\"exp\", \"iat\"]})\n"
+        "# never accept algorithms=[\"none\"] and never trust the kid header blindly",
+    ),
+    "oauth": (
+        "Use an exact-match allowlist for redirect_uris, always send and "
+        "verify a state (and PKCE) parameter, and never leak codes via the "
+        "fragment to third parties.",
+        "python",
+        "ALLOWED_REDIRECTS = {\"https://app.example.com/callback\"}\n"
+        "if redirect_uri not in ALLOWED_REDIRECTS:\n"
+        "    abort(400)\n"
+        "state = secrets.token_urlsafe(32)  # bind to the user session",
+    ),
+    "hostheader": (
+        "Never build absolute URLs from the Host header. Configure the "
+        "web server with an explicit server name and reject unknown hosts.",
+        "nginx",
+        "server {\n"
+        "    listen 443 ssl;\n"
+        "    server_name app.example.com;  # explicit, no wildcards\n"
+        "    # password-reset links use a configured base URL, not $host\n"
+        "}",
+    ),
+    "secrets": (
+        "Revoke every exposed secret, move secrets to a vault or env-based "
+        "config, and add pre-commit secret scanning.",
+        "bash",
+        "# rotate immediately, then stop committing secrets\n"
+        "git rm --cached .env && echo '.env' >> .gitignore\n"
+        "# store at runtime instead:\n"
+        "export STRIPE_KEY=\"sk_live_...\"  # via your secret manager",
+    ),
+    "jssecrets": (
+        "Same as exposed secrets: revoke, rotate, and never ship API keys "
+        "in client-side bundles. Use backend proxies for keyed calls.",
+        "javascript",
+        "// bad:  const key = \"sk_live_...\";\n"
+        "// good: call your own backend, which holds the key server-side\n"
+        "const data = await fetch(\"/api/internal/resource\").then(r => r.json());",
+    ),
+    "cachepoison": (
+        "Do not cache responses keyed on untrusted input. Mark dynamic "
+        "content Cache-Control: no-store and strip unkeyed headers at the "
+        "cache layer.",
+        "http",
+        "Cache-Control: no-store, must-revalidate\n"
+        "# CDN rule: only cache when the response has no Set-Cookie and the\n"
+        "# request carries no unkeyed headers",
+    ),
+    "ppollution": (
+        "Use null-prototype objects or Maps for merging user input, and "
+        "freeze Object.prototype-adjacent paths in recursive merge code.",
+        "javascript",
+        "const store = Object.create(null);  // no prototype to pollute\n"
+        "// or harden merges:\n"
+        "if ([\"__proto__\", \"constructor\", \"prototype\"].includes(key)) continue;",
+    ),
+    "tech": (
+        "Keep components patched and hide version banners where possible. "
+        "Track CVEs for every versioned component in the stack.",
+        "bash",
+        "# example: hide nginx version\n"
+        "# nginx.conf: server_tokens off;\n"
+        "# then subscribe to vendor security lists for each component",
+    ),
+    "cve": (
+        "Patch to the fixed version (or apply the vendor workaround), then "
+        "re-test. Prioritize CVEs with public exploits affecting reachable "
+        "services.",
+        "bash",
+        "# upgrade the affected package and verify\n"
+        "apt-get update && apt-get install --only-upgrade <package>\n"
+        "dpkg -l | grep <package>  # confirm the fixed version",
+    ),
+    "phish": (
+        "If this is your own domain: deploy SPF, DKIM and DMARC with a "
+        "reject policy, and monitor lookalike registrations.",
+        "dns",
+        "_dmarc.example.com.  TXT  \"v=DMARC1; p=reject; rua=mailto:dmarc@example.com\"",
+    ),
+    "wordlist": (
+        "Remove or protect the discovered path: authentication, IP "
+        "allowlisting, or removal if it is not needed.",
+        "nginx",
+        "location /internal/ {\n"
+        "    allow 10.0.0.0/8;\n"
+        "    deny all;\n"
+        "    auth_basic \"restricted\";\n"
+        "    auth_basic_user_file /etc/nginx/.htpasswd;\n"
+        "}",
+    ),
+    "redirect_mod": (
+        "See 'redirect': allowlist redirect targets and reject absolute URLs.",
+        "python",
+        "if urlparse(target).netloc:\n    target = \"/\"",
+    ),
+}
+
+
+def _remediation_for(finding):
+    """Return (summary, language, code) for a finding.
+
+    Prefers the finding's own remediation text, then the per-module
+    library, then a generic fallback.
+    """
+    own = str(finding.get("remediation") or "").strip()
+    module = str(finding.get("module") or "").lower()
+    lib = REMEDIATION.get(module)
+    if lib and not own:
+        return lib
+    if lib and own:
+        return (own, lib[1], lib[2])
+    if own:
+        return (own, "", "")
+    return (
+        "Investigate the finding, confirm it manually, and apply the "
+        "vendor or framework recommended fix for the affected component.",
+        "", "",
+    )
+
+
 def esc(value) -> str:
     return _html.escape("" if value is None else str(value), quote=True)
 
@@ -338,6 +540,7 @@ def _finding_card(f, hosts=None) -> str:
     evidence = f.get("evidence") or ""
     remediation = f.get("remediation") or ""
     next_steps = f.get("next_steps") or ""
+    rem_summary, rem_lang, rem_code = _remediation_for(f)
     parts = ['<div class="finding">']
     parts.append("<h3>%s</h3>" % esc(f.get("title", "(untitled)")))
     parts.append('<div class="badges">'
@@ -355,8 +558,9 @@ def _finding_card(f, hosts=None) -> str:
         parts.append("<p>%s</p>" % esc(body))
     if evidence:
         parts.append('<h4>Evidence</h4><pre class="evidence">%s</pre>' % esc(evidence))
-    if remediation:
-        parts.append("<h4>Remediation</h4><p>%s</p>" % esc(remediation))
+    parts.append("<h4>Remediation</h4><p>%s</p>" % esc(remediation or rem_summary))
+    if rem_code:
+        parts.append('<pre class="evidence">%s</pre>' % esc(rem_code))
     if next_steps:
         parts.append("<h4>Next steps</h4><p>%s</p>" % esc(next_steps))
     parts.append("</div>")
@@ -445,7 +649,12 @@ def _generate_html(target, ctx, findings, out=None) -> str:
 _MD = """# {platform} Submission Report
 **Target:** {target}  |  **Date:** {date}  |  **Profile:** {profile}
 
+## Executive summary
+
+{exec_summary}
+
 ---
+{notice}
 {entries}
 ---
 
@@ -467,8 +676,27 @@ _ENTRY = """## {idx}. {title}
 
 ### Remediation
 {remediation}
-
+{remediation_code}
 """
+
+
+def _md_exec_summary(target, findings) -> str:
+    counts = {s: sum(1 for f in findings if _sev(f) == s) for s in SEV_ORDER}
+    total = len(findings)
+    if not total:
+        return "No findings were recorded for %s in this assessment run." % target
+    ordered = sorted(findings, key=_sort_key)
+    top = ordered[0]
+    lines = [
+        "Arsenal recorded **%d** finding(s) for **%s**: %s." % (
+            total, target,
+            ", ".join("%d %s" % (counts[s], s.capitalize())
+                      for s in SEV_ORDER if counts[s])),
+        "Highest-ranked issue: **%s** (%s severity, %s confidence, %s module)." % (
+            top.get("title", ""), _sev(top).capitalize(),
+            _conf(top).capitalize(), top.get("module", "")),
+    ]
+    return "\n\n".join(lines)
 
 
 def _md_field(f, *keys, default="-"):
@@ -481,13 +709,22 @@ def _md_field(f, *keys, default="-"):
 
 def _generate_md(target, ctx, findings, fmt, out=None) -> str:
     platform = "YesWeHack" if fmt == "yeswehack" else "HackerOne"
-    ordered = sorted(findings, key=_sort_key)[:10]
+    ordered = sorted(findings, key=_sort_key)  # all findings; never silently truncated
+    notice = ("*This report includes all %d recorded finding(s), ordered by "
+              "severity.*\n" % len(ordered)) if ordered else ""
     entries = []
     for i, f in enumerate(ordered, 1):
         repro = f.get("reproduction") or f.get("repro_steps") or f.get("evidence") or "-"
         impact = f.get("impact") or (
             "A %s severity issue (%s confidence). See description for exploitability "
             "context." % (_sev(f), _conf(f)))
+        rem_summary, rem_lang, rem_code = _remediation_for(f)
+        remediation_code = ""
+        if rem_code:
+            remediation_code = "\n```%s\n%s\n```\n" % (rem_lang or "text", rem_code)
+        remediation_text = f.get("remediation") or rem_summary
+        if isinstance(remediation_text, list):
+            remediation_text = "\n".join(str(x) for x in remediation_text)
         entries.append(_ENTRY.format(
             idx=i,
             title=_md_field(f, "title"),
@@ -498,7 +735,8 @@ def _generate_md(target, ctx, findings, fmt, out=None) -> str:
             description=_md_field(f, "report_section", "description"),
             impact=impact,
             repro=repro,
-            remediation=_md_field(f, "remediation"),
+            remediation=remediation_text,
+            remediation_code=remediation_code,
         ))
     if not entries:
         entries.append("_No findings to report._\n")
@@ -507,6 +745,8 @@ def _generate_md(target, ctx, findings, fmt, out=None) -> str:
         target=target,
         date=datetime.now().strftime("%Y-%m-%d"),
         profile=_profile(ctx),
+        exec_summary=_md_exec_summary(target, ordered),
+        notice=notice,
         entries="\n".join(entries),
     )
     out = out or os.path.join(_ws_dir(ctx, target), "report-%s.md" % fmt)
@@ -516,6 +756,189 @@ def _generate_md(target, ctx, findings, fmt, out=None) -> str:
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(doc)
     return out
+
+
+# --------------------------------------------------------------------------
+# Trend graphs across hunts (no new dependencies: ASCII + inline SVG)
+# --------------------------------------------------------------------------
+
+def _trend_roots(ctx):
+    roots = []
+    ws = getattr(ctx, "workspace", None)
+    if ws is not None:
+        for attr in ("root", "base", "dir", "basedir"):
+            val = getattr(ws, attr, None)
+            if isinstance(val, str) and os.path.isdir(os.path.expanduser(val)):
+                roots.append(os.path.expanduser(val))
+    home = os.path.expanduser("~/.arsenal")
+    for name in ("workspaces", "workspace"):
+        d = os.path.join(home, name)
+        if os.path.isdir(d) and d not in roots:
+            roots.append(d)
+    return roots
+
+
+def _trend_data(ctx, weeks=12):
+    """Bucket finding severities per ISO week across all hunt workspaces.
+
+    Returns (week_labels, {severity: [counts]}). A finding counts in the
+    week of its "ts" field, falling back to the findings.json mtime.
+    """
+    buckets = {}
+    for root in _trend_roots(ctx):
+        try:
+            targets = sorted(d for d in os.listdir(root)
+                             if os.path.isdir(os.path.join(root, d)))
+        except OSError:
+            continue
+        for target in targets:
+            path = os.path.join(root, target, "findings.json")
+            if not os.path.isfile(path):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = None
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                data = data.get("findings", [])
+            if not isinstance(data, list):
+                continue
+            for f in data:
+                if not isinstance(f, dict):
+                    continue
+                ts = str(f.get("ts") or "")
+                when = None
+                if ts:
+                    try:
+                        when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except ValueError:
+                        when = None
+                if when is None and mtime:
+                    when = datetime.fromtimestamp(mtime)
+                if when is None:
+                    continue
+                iso_year, iso_week, _ = when.isocalendar()
+                label = "%d-W%02d" % (iso_year, iso_week)
+                sev = _sev(f)
+                buckets.setdefault(label, {s: 0 for s in SEV_ORDER})
+                buckets[label][sev] += 1
+    labels = sorted(buckets)[-weeks:]
+    series = {s: [buckets[label][s] for label in labels] for s in SEV_ORDER}
+    return labels, series
+
+
+def _trends_ascii(labels, series) -> str:
+    """ASCII bar chart of total findings per week, split by severity."""
+    if not labels:
+        return "No trend data yet (no findings with timestamps in any workspace)."
+    totals = [sum(series[s][i] for s in SEV_ORDER) for i in range(len(labels))]
+    peak = max(totals) or 1
+    width = 40
+    glyph = {"critical": "#", "high": "H", "medium": "M", "low": "L", "info": "i"}
+    lines = ["Findings per week (across all hunts):", ""]
+    for i, label in enumerate(labels):
+        bar = ""
+        for s in SEV_ORDER:
+            n = series[s][i]
+            seg = int(round(n / peak * width)) if n else 0
+            bar += glyph[s] * seg
+        bar = (bar + " " * width)[:width]
+        lines.append("%s |%s| %d" % (label, bar, totals[i]))
+    lines.append("")
+    lines.append("Legend: # critical  H high  M medium  L low  i info")
+    return "\n".join(lines)
+
+
+def _trends_svg(labels, series) -> str:
+    """Inline SVG grouped bar chart (no JS, no external deps)."""
+    if not labels:
+        return "<p>No trend data yet.</p>"
+    colors = {"critical": "#ff5d5d", "high": "#ff8a5c", "medium": "#ffb020",
+              "low": "#4cc38a", "info": "#58a6ff"}
+    n = len(labels)
+    bw, gap, left, top, height = 34, 14, 70, 20, 220
+    width = left + n * (bw + gap) + 20
+    peak = max((sum(series[s][i] for s in SEV_ORDER) for i in range(n)), default=0) or 1
+    parts = ['<svg viewBox="0 0 %d %d" width="100%%" role="img" '
+             'aria-label="Findings trend across hunts">' % (width, height + top + 40)]
+    # gridlines
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        y = top + height - frac * height
+        val = int(round(frac * peak))
+        parts.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#2a3348"/>'
+                     % (left, y, width - 20, y))
+        parts.append('<text x="%d" y="%d" fill="#8a93a6" font-size="10" '
+                     'text-anchor="end">%d</text>' % (left - 6, y + 3, val))
+    for i, label in enumerate(labels):
+        x = left + i * (bw + gap)
+        y0 = top + height
+        for s in SEV_ORDER:
+            v = series[s][i]
+            h = v / peak * height
+            if h > 0:
+                parts.append('<rect x="%d" y="%.1f" width="%d" height="%.1f" fill="%s">'
+                             '<title>%s %s: %d</title></rect>'
+                             % (x, y0 - h, bw, h, colors[s], label, s, v))
+                y0 -= h
+        parts.append('<text x="%d" y="%d" fill="#8a93a6" font-size="10" '
+                     'text-anchor="middle" transform="rotate(-30 %d %d)">%s</text>'
+                     % (x + bw / 2, height + top + 28, x + bw / 2,
+                        height + top + 28, label))
+    # legend
+    lx = left
+    for s in SEV_ORDER:
+        parts.append('<rect x="%d" y="%d" width="10" height="10" fill="%s"/>'
+                     % (lx, height + top + 34, colors[s]))
+        parts.append('<text x="%d" y="%d" fill="#9fb3d1" font-size="11">%s</text>'
+                     % (lx + 14, height + top + 43, s))
+        lx += 78
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def generate_trends(ctx, fmt="html", out=None) -> str:
+    """Write a cross-hunt trend report. Returns the filepath."""
+    fmt = str(fmt or "html").lower()
+    labels, series = _trend_data(ctx)
+    if fmt == "md":
+        doc = ("# Hunt Trends (all targets)\n\n"
+               "*Generated %s*\n\n```\n%s\n```\n"
+               % (datetime.now().strftime("%Y-%m-%d %H:%M"),
+                  _trends_ascii(labels, series)))
+        out = out or os.path.join(
+            os.path.expanduser("~/.arsenal"), "trends.md")
+    elif fmt == "html":
+        doc = ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+               "<title>Hunt trends</title><style>"
+               "body{background:#0d1117;color:#dbe2f0;font-family:sans-serif;"
+               "max-width:1100px;margin:0 auto;padding:24px}</style></head>"
+               "<body><h1>Hunt trends (all targets)</h1>"
+               "<p>Generated %s</p>%s<pre>%s</pre></body></html>"
+               % (datetime.now().strftime("%Y-%m-%d %H:%M"),
+                  _trends_svg(labels, series),
+                  esc(_trends_ascii(labels, series))))
+        out = out or os.path.join(
+            os.path.expanduser("~/.arsenal"), "trends.html")
+    else:
+        raise ValueError("Unknown trends format %r (html|md)" % fmt)
+    directory = os.path.dirname(out)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+    return out
+
+
+def cmd_trends(args, ctx):
+    path = generate_trends(ctx, fmt=getattr(args, "format", "html"),
+                           out=getattr(args, "out", None))
+    print("Trend report written to %s" % path)
+    return 0
 
 
 def generate(target, ctx, fmt="html", out=None) -> str:
@@ -538,6 +961,11 @@ def add_parsers(sub):
                    help="Report format (default: html)")
     p.add_argument("--out", default=None, help="Output path override")
     p.set_defaults(func=dispatch)
+    t = sub.add_parser("trends", help="Trend graphs across hunts (ASCII/SVG)")
+    t.add_argument("--format", default="html", choices=["html", "md"],
+                   help="Trend report format (default: html)")
+    t.add_argument("--out", default=None, help="Output path override")
+    t.set_defaults(func=cmd_trends)
     return sub
 
 

@@ -38,6 +38,62 @@ INTERESTING_TECH = (
 VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 
 
+def _exploitable_modules():
+    try:
+        from arsenal.modules import REGISTRY
+        known = set(REGISTRY)
+    except Exception:
+        known = set()
+    return {m for m in ("xss", "sqli", "ssrf", "rce", "lfi", "idor",
+                        "auth-bypass")
+            if (not known) or m in known}
+
+
+_SEV_POINTS = {"critical": 40, "high": 30, "medium": 15, "low": 5, "info": 0}
+_CONF_POINTS = {"proven": 20, "strong": 10, "review": 0}
+
+
+def score_finding(finding):
+    """Score one finding 0-100 for hunt priority (autopilot ordering).
+
+    Returns {"score", "reasons", "verdict"} where verdict is
+    "verify now" | "triage first" | "context".
+    """
+    if not isinstance(finding, dict):
+        return {"score": 0, "reasons": [], "verdict": "context"}
+    score = 0
+    reasons = []
+    sev = str(finding.get("severity") or "info").lower()
+    pts = _SEV_POINTS.get(sev, 0)
+    if pts:
+        score += pts
+        reasons.append("%s severity (+%d)" % (sev, pts))
+    conf = str(finding.get("confidence") or "review").lower()
+    cpts = _CONF_POINTS.get(conf, 0)
+    if cpts:
+        score += cpts
+        reasons.append("%s confidence (+%d)" % (conf, cpts))
+    module = str(finding.get("module") or "").lower()
+    if module in _exploitable_modules():
+        score += 15
+        reasons.append("directly-exploitable class %s (+15)" % module)
+    if finding.get("param") or finding.get("parameter"):
+        score += 5
+        reasons.append("has an injection parameter (+5)")
+    evidence = str(finding.get("evidence") or "")
+    if len(evidence) > 120:
+        score += 5
+        reasons.append("substantial evidence captured (+5)")
+    score = min(100, score)
+    if score >= 50:
+        verdict = "verify now"
+    elif score >= 25:
+        verdict = "triage first"
+    else:
+        verdict = "context"
+    return {"score": score, "reasons": reasons, "verdict": verdict}
+
+
 def _hostname_tokens(host):
     """Split a hostname into lowercase tokens on dots, dashes, underscores."""
     return [t for t in re.split(r"[.\-_]+", (host or "").lower()) if t]

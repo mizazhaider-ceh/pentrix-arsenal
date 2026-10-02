@@ -133,6 +133,37 @@ def search_memory(ctx, target, query):
     return matches
 
 
+def recent_decisions(ctx, target, limit=20):
+    """Latest autopilot decision records (newest first). Never raises."""
+    records = [r for r in read_memory(ctx, target)
+               if isinstance(r, dict) and r.get("kind") == "decision"]
+    return records[-limit:][::-1]
+
+
+def decision_stats(ctx, target):
+    """Per-decision-kind stats: runs, total and average new findings.
+
+    Used by the autopilot planner to learn which actions pay off.
+    Never raises.
+    """
+    stats = {}
+    for r in read_memory(ctx, target):
+        if not isinstance(r, dict) or r.get("kind") != "decision":
+            continue
+        kind = str(r.get("decision") or "?")
+        try:
+            new = int(r.get("new_findings") or 0)
+        except (TypeError, ValueError):
+            new = 0
+        entry = stats.setdefault(kind, {"runs": 0, "new_findings": 0})
+        entry["runs"] += 1
+        entry["new_findings"] += new
+    for entry in stats.values():
+        runs = entry["runs"] or 1
+        entry["avg_new_findings"] = round(entry["new_findings"] / runs, 2)
+    return stats
+
+
 def hunt_summary(ctx, target):
     """Build a hunt summary dict. Never raises."""
     records = read_memory(ctx, target)

@@ -15,10 +15,10 @@ remediation.
 """
 
 import os
-import re
 from pathlib import Path
 
-from arsenal.findings import make_finding
+from arsenal.modules import secret_rules
+from arsenal.modules.base import BaseModule
 
 NAME = "secrets"
 DESCRIPTION = (
@@ -32,108 +32,20 @@ INTRUSIVE = False
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_MATCHES_PER_FILE = 25
 
+_mod = BaseModule(NAME, 10)
+_log = _mod.log_msg
+_finding = _mod.finding
+
 DEFAULT_EXCLUDES = [".git", "node_modules", "__pycache__", ".venv"]
 
-# Detection rules: (rule name, compiled pattern, severity, CWE).
-# Rule patterns adapted from pentrix-secrets.
-RULES = [
-    (
-        "AWS Access Key ID",
-        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-        "high",
-        "CWE-798",
-    ),
-    (
-        "AWS Secret Key Assignment",
-        re.compile(
-            r"(?i)\baws[_-]?secret[_-]?access[_-]?key\b\s*[:=]\s*"
-            r"['\"]?([A-Za-z0-9/+=]{30,})['\"]?"
-        ),
-        "high",
-        "CWE-798",
-    ),
-    (
-        "Private Key Block",
-        re.compile(r"-----BEGIN (?:[A-Z ]*)PRIVATE KEY-----"),
-        "high",
-        "CWE-798",
-    ),
-    (
-        "GitHub Token",
-        re.compile(
-            r"\b(ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|"
-            r"github_pat_[A-Za-z0-9_]{20,})\b"
-        ),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "GitLab Token",
-        re.compile(r"\bglpat-[A-Za-z0-9_\-]{16,}\b"),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "Slack Token",
-        re.compile(r"\bxox[bap]-[A-Za-z0-9-]{10,}\b"),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "Google API Key",
-        re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "Stripe Secret Key",
-        re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{10,}\b"),
-        "medium",
-        "CWE-798",
-    ),
-    (
-        "JWT Token",
-        re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
-        "medium",
-        "CWE-200",
-    ),
-    (
-        "Generic API Key Assignment",
-        re.compile(
-            r"(?i)\b(?:api[_-]?key|apikey|api[_-]?secret|secret)\b\s*[:=]\s*"
-            r"['\"][^'\"]{4,}['\"]"
-        ),
-        "medium",
-        "CWE-798",
-    ),
-]
-
+# Detection rules: the single canonical table lives in
+# arsenal.modules.secret_rules (shared with jssecrets_mod and jsintel_mod).
+RULES = secret_rules.RULES
 
 # ---------------------------------------------------------------------------
 # Helpers adapted from pentrix-secrets
 # ---------------------------------------------------------------------------
-def _log(ctx, message):
-    log = getattr(ctx, "log", None)
-    if callable(log):
-        try:
-            log(message)
-        except Exception:
-            pass
 
-
-def _make_finding(**fields):
-    try:
-        return make_finding(**fields)
-    except Exception:
-        return dict(fields)
-
-
-def _redact(text):
-    """Show only the first 4 and last 2 characters of a matched secret."""
-    text = text.strip()
-    if len(text) <= 8:
-        return "***REDACTED***"
-    return "%s...%s" % (text[:4], text[-2:])
 
 
 def _is_binary(path):
@@ -168,34 +80,18 @@ def _iter_target_files(target, recursive, excludes):
 
 
 def _scan_file(path):
-    """Scan one file line by line. Returns a list of match dicts."""
-    matches = []
+    """Scan one file line by line against the shared rule table."""
     try:
         if path.stat().st_size > MAX_FILE_BYTES:
-            return matches
+            return []
     except OSError:
-        return matches
+        return []
     try:
         with open(path, "r", encoding="utf-8", errors="strict") as handle:
-            lines = handle.readlines()
+            content = handle.read()
     except (OSError, UnicodeDecodeError):
-        return matches
-    for lineno, line in enumerate(lines, start=1):
-        for rule_name, pattern, severity, cwe in RULES:
-            for match in pattern.finditer(line):
-                snippet = match.group(0).strip()
-                matches.append(
-                    {
-                        "rule": rule_name,
-                        "severity": severity,
-                        "cwe": cwe,
-                        "line": lineno,
-                        "snippet": snippet,
-                    }
-                )
-                if len(matches) >= MAX_MATCHES_PER_FILE:
-                    return matches
-    return matches
+        return []
+    return secret_rules.scan_text(content, max_matches=MAX_MATCHES_PER_FILE)
 
 
 def _build_finding(target, path, match):
@@ -211,7 +107,7 @@ def _build_finding(target, path, match):
         path,
         match["line"],
         rule,
-        _redact(match["snippet"]),
+        secret_rules.redact(match["snippet"]),
     )
     remediation = (
         "Rotate or revoke the exposed credential immediately and check for "
@@ -219,7 +115,7 @@ def _build_finding(target, path, match):
         "or environment variable, and verify it was never committed to "
         "version control history."
     )
-    return _make_finding(
+    return _finding(
         module=NAME,
         target=str(target),
         severity=match["severity"],

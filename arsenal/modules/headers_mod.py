@@ -7,10 +7,8 @@ header (HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy).
 Non-intrusive: a single GET request per target. Standard library only.
 """
 
-import urllib.parse
+from arsenal.modules.base import BaseModule
 
-from arsenal.findings import make_finding
-from arsenal.http import fetch
 
 NAME = "headers"
 DESCRIPTION = (
@@ -45,65 +43,18 @@ REFERRER_FIX = "Add header Referrer-Policy: strict-origin-when-cross-origin"
 
 
 # ---------------------------------------------------------------------------
-# Small helpers (module-local so the module stays self-contained)
+# Shared module helpers, bound from arsenal.modules.base (replaces the old
+# per-module copies). All HTTP goes through arsenal.http with ctx, so
+# stealth sleeps, UA rotation and proxy settings apply to module traffic.
 # ---------------------------------------------------------------------------
-
-def _timeout(ctx):
-    cfg = getattr(ctx, "config", None)
-    if isinstance(cfg, dict):
-        return cfg.get("timeout", TIMEOUT)
-    if cfg is not None:
-        return getattr(cfg, "timeout", TIMEOUT)
-    return TIMEOUT
-
-
-def _log(ctx, level, msg):
-    log = getattr(ctx, "log", None)
-    if log is None:
-        return
-    try:
-        getattr(log, level, log.warning)(msg)
-    except Exception:
-        pass
-
-
-def _is_http_url(target):
-    try:
-        parts = urllib.parse.urlsplit(target)
-    except Exception:
-        return False
-    return parts.scheme in ("http", "https") and bool(parts.netloc)
-
-
-def _host_of(url):
-    try:
-        return urllib.parse.urlsplit(url).hostname or ""
-    except Exception:
-        return ""
-
-
-def _in_scope(target, ctx):
-    scope = getattr(ctx, "scope", None)
-    if scope is None:
-        return True
-    try:
-        return bool(scope.contains(_host_of(target)))
-    except Exception:
-        return True
-
-
-def _get(url, ctx):
-    try:
-        return fetch(url, timeout=_timeout(ctx), allow_redirects=True)
-    except Exception as exc:
-        _log(ctx, "debug", "%s: request failed for %s: %s" % (NAME, url, exc))
-        return None
-
-
-def _finding(**kwargs):
-    kwargs.setdefault("module", NAME)
-    return make_finding(**kwargs)
-
+_mod = BaseModule(NAME, TIMEOUT)
+_timeout = _mod.timeout
+_log = _mod.log
+_is_http_url = _mod.is_http_url
+_host_of = _mod.host_of
+_in_scope = _mod.in_scope
+_get = _mod.get
+_finding = _mod.finding
 
 def _header_dump(headers, limit=900):
     lines = ["%s: %s" % (name, value) for name, value in sorted(headers.items())]
@@ -159,20 +110,62 @@ def check_hsts(headers):
     return findings
 
 
+def _csp_directive_map(value):
+    """Parse a CSP value into {directive: [sources]}."""
+    directives = {}
+    for part in value.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        tokens = part.split()
+        directives[tokens[0].lower()] = [t.lower() for t in tokens[1:]]
+    return directives
+
+
+# Source expressions that make a script/style policy effectively open.
+_CSP_WILDCARDS = ("*", "data:", "blob:", "https:", "http:")
+_CSP_UNSAFE = ("'unsafe-inline'", "'unsafe-eval'")
+
+
 def check_csp(headers):
     findings = []
     csp = headers.get("content-security-policy")
     report_only = headers.get("content-security-policy-report-only")
-    if csp:
-        findings.append(("PASS", "CSP", 0,
-                         "Content-Security-Policy present: %s" % trim(csp), None))
-    elif report_only:
-        findings.append(("WARN", "CSP", -10,
-                         "Only Content-Security-Policy-Report-Only is set; nothing is enforced",
-                         CSP_RO_FIX))
-    else:
+    if not csp:
+        if report_only:
+            findings.append(("WARN", "CSP", -10,
+                             "Only Content-Security-Policy-Report-Only is set; nothing is enforced",
+                             CSP_RO_FIX))
+        else:
+            findings.append(("FAIL", "CSP", -20,
+                             "Content-Security-Policy missing", CSP_FIX))
+        return findings
+
+    directives = _csp_directive_map(csp)
+    problems = []
+    script_src = directives.get("script-src", directives.get("default-src", []))
+    for source in script_src:
+        if source in _CSP_WILDCARDS or source.endswith(":*"):
+            problems.append("script-src allows wildcard source %r" % source)
+        elif source in _CSP_UNSAFE:
+            problems.append("script-src allows %s" % source)
+    default_src = directives.get("default-src", [])
+    if any(s in _CSP_WILDCARDS for s in default_src):
+        problems.append("default-src allows wildcard sources")
+    object_src = directives.get("object-src", [])
+    if "'none'" not in object_src:
+        problems.append("object-src is not restricted to 'none' "
+                        "(plugin content can load)")
+    if "base-uri" not in directives:
+        problems.append("base-uri is not set (base-tag hijacking possible)")
+    if problems:
         findings.append(("FAIL", "CSP", -20,
-                         "Content-Security-Policy missing", CSP_FIX))
+                         "Weak Content-Security-Policy: %s. Policy: %s"
+                         % ("; ".join(problems), trim(csp)), CSP_FIX))
+    else:
+        findings.append(("PASS", "CSP", 0,
+                         "Content-Security-Policy present and restrictive: %s"
+                         % trim(csp), None))
     return findings
 
 
@@ -207,12 +200,35 @@ def check_xcto(headers):
     return [("FAIL", "MIME", -10, "X-Content-Type-Options missing", XCTO_FIX)]
 
 
+# Referrer-Policy values ordered from safest to least safe. Anything not
+# on this list (including "unsafe-url") leaks more than it should.
+_REFERRER_SAFE = (
+    "no-referrer",
+    "same-origin",
+    "strict-origin",
+    "no-referrer-when-downgrade",
+    "strict-origin-when-cross-origin",
+    "origin",
+    "origin-when-cross-origin",
+)
+
+
 def check_referrer_policy(headers):
-    value = headers.get("referrer-policy")
-    if value:
-        return [("PASS", "Referrer", 0,
-                 "Referrer-Policy: %s" % value, None)]
-    return [("WARN", "Referrer", -5, "Referrer-Policy missing", REFERRER_FIX)]
+    value = (headers.get("referrer-policy") or "").strip().lower()
+    if not value:
+        return [("WARN", "Referrer", -5, "Referrer-Policy missing",
+                 REFERRER_FIX)]
+    if value == "unsafe-url":
+        return [("FAIL", "Referrer", -10,
+                 "Referrer-Policy is 'unsafe-url': the full URL (including "
+                 "query strings and tokens) leaks to every third party",
+                 REFERRER_FIX)]
+    if value not in _REFERRER_SAFE:
+        return [("WARN", "Referrer", -5,
+                 "Referrer-Policy has an unusual value: %r" % value,
+                 REFERRER_FIX)]
+    return [("PASS", "Referrer", 0,
+             "Referrer-Policy: %s" % value, None)]
 
 
 def analyze(final_url, headers):
@@ -250,6 +266,9 @@ def _map_finding(check, result, detail, fix):
     if check == "HSTS" and result == "WARN":
         return ("low", "Weak Strict-Transport-Security header", "CWE-319")
     if check == "CSP" and result == "FAIL":
+        if detail.startswith("Weak"):
+            return ("medium", "Weak Content-Security-Policy allows unsafe sources",
+                    "CWE-693")
         return ("medium", "Missing Content-Security-Policy header", "CWE-693")
     if check == "CSP" and result == "WARN":
         return ("low", "Content-Security-Policy is report-only (not enforced)",
@@ -262,6 +281,9 @@ def _map_finding(check, result, detail, fix):
         return ("low", "Missing X-Content-Type-Options header", "CWE-693")
     if check == "Referrer" and result == "WARN":
         return ("info", "Missing Referrer-Policy header", "CWE-200")
+    if check == "Referrer" and result == "FAIL":
+        return ("low", "Referrer-Policy leaks full URLs (unsafe-url)",
+                "CWE-200")
     return None
 
 

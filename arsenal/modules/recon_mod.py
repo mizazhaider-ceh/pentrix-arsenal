@@ -12,6 +12,7 @@ the arsenal.http client so every network call carries an explicit timeout.
 
 import json
 import socket
+import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -21,8 +22,9 @@ from arsenal.findings import make_finding
 
 NAME = "recon"
 DESCRIPTION = (
-    "Passive subdomain enumeration (crt.sh, CertSpotter, hackertarget) "
-    "with HTTP alive checks and subdomain-takeover triage"
+    "Passive subdomain enumeration (crt.sh, CertSpotter, hackertarget, "
+    "AlienVault OTX, BufferOverrun, urlscan.io) with HTTP alive checks "
+    "and subdomain-takeover triage"
 )
 TARGET_KIND = "domain"
 INTRUSIVE = False
@@ -58,50 +60,94 @@ DEAD_SERVICE_SUFFIXES = (
 # ---------------------------------------------------------------------------
 # enumeration sources (adapted from pentrix-recon)
 # ---------------------------------------------------------------------------
+# enumeration sources
+#
+# Every source takes (domain, timeout, ctx) and returns a set of hostnames.
+# fetch_json/fetch_text return (status, payload, final_url) tuples, so the
+# payload is unpacked explicitly (an earlier revision forgot this and every
+# source silently returned nothing).
+# ---------------------------------------------------------------------------
 
-def _source_crtsh(domain, timeout):
+def _fetch_json_retry(url, timeout, ctx, retries=2):
+    """GET JSON with a small backoff on empty/failed responses."""
+    delay = 1.0
+    for attempt in range(retries + 1):
+        try:
+            status, data, _final = fetch_json(url, timeout=timeout, ctx=ctx)
+        except Exception:
+            status, data = 0, None
+        if data is not None and status not in (429,) and not (
+                status and status >= 500):
+            return data
+        if attempt < retries:
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+
+def _fetch_text_retry(url, timeout, ctx, retries=2):
+    """GET text with a small backoff on empty/failed responses."""
+    delay = 1.0
+    for attempt in range(retries + 1):
+        try:
+            status, text, _final = fetch_text(url, timeout=timeout, ctx=ctx)
+        except Exception:
+            status, text = 0, ""
+        if text and status not in (429,) and not (status and status >= 500):
+            return text
+        if attempt < retries:
+            time.sleep(delay)
+            delay *= 2
+    return ""
+
+
+def _clean_name(name):
+    name = str(name or "").strip().lower().rstrip(".")
+    if name.startswith("*."):
+        name = name[2:]
+    return name
+
+
+def _source_crtsh(domain, timeout, ctx):
     """Enumerate via crt.sh certificate transparency search."""
     q = urllib.parse.quote("%%.%s" % domain, safe="")
     url = "https://crt.sh/?q=%s&output=json" % q
     found = set()
-    data = fetch_json(url, timeout=timeout)
+    data = _fetch_json_retry(url, timeout, ctx)
     if not isinstance(data, list):
         return found
     for entry in data:
         names = entry.get("name_value", "") if isinstance(entry, dict) else ""
         for name in str(names or "").splitlines():
-            name = name.strip().lower()
-            if name.startswith("*."):
-                name = name[2:]
+            name = _clean_name(name)
             if name:
                 found.add(name)
     return found
 
 
-def _source_certspotter(domain, timeout):
+def _source_certspotter(domain, timeout, ctx):
     """Enumerate via the CertSpotter v1 issuances API."""
     q = urllib.parse.quote(domain, safe="")
     url = "https://api.certspotter.com/v1/issuances?domain=%s&expand=dns_names" % q
     found = set()
-    data = fetch_json(url, timeout=timeout)
+    data = _fetch_json_retry(url, timeout, ctx)
     if not isinstance(data, list):
         return found
     for issuance in data:
-        for name in (issuance.get("dns_names") or []) if isinstance(issuance, dict) else []:
-            name = str(name).strip().lower()
-            if name.startswith("*."):
-                name = name[2:]
+        names = (issuance.get("dns_names") or []) if isinstance(issuance, dict) else []
+        for name in names:
+            name = _clean_name(name)
             if name:
                 found.add(name)
     return found
 
 
-def _source_hackertarget(domain, timeout):
-    """Enumerate via the hackertarget hostsearch API."""
+def _source_hackertarget(domain, timeout, ctx):
+    """Enumerate via the hackertarget hostsearch API (rate-limited, flaky)."""
     q = urllib.parse.quote(domain, safe="")
     url = "https://api.hackertarget.com/hostsearch/?q=%s" % q
-    body = fetch_text(url, timeout=timeout)
     found = set()
+    body = _fetch_text_retry(url, timeout, ctx)
     if not isinstance(body, str) or not body.strip():
         return found
     if "error" in body.lower():
@@ -110,9 +156,57 @@ def _source_hackertarget(domain, timeout):
         line = line.strip()
         if not line or "," not in line:
             continue
-        host = line.split(",", 1)[0].strip().lower()
+        host = _clean_name(line.split(",", 1)[0])
         if host:
             found.add(host)
+    return found
+
+
+def _source_otx(domain, timeout, ctx):
+    """Enumerate via AlienVault OTX passive DNS (no key needed)."""
+    q = urllib.parse.quote(domain, safe="")
+    url = ("https://otx.alienvault.com/api/v1/indicators/domain/%s/"
+           "passive_dns" % q)
+    found = set()
+    data = _fetch_json_retry(url, timeout, ctx)
+    if not isinstance(data, dict):
+        return found
+    for record in data.get("passive_dns") or []:
+        name = _clean_name(record.get("hostname") if isinstance(record, dict) else "")
+        if name:
+            found.add(name)
+    return found
+
+
+def _source_bufferover(domain, timeout, ctx):
+    """Enumerate via BufferOverrun TLS certificate search (free, no key)."""
+    q = urllib.parse.quote(domain, safe="")
+    url = "https://tls.bufferover.run/dns?q=.%s" % q
+    found = set()
+    data = _fetch_json_retry(url, timeout, ctx)
+    if not isinstance(data, dict):
+        return found
+    for entry in data.get("Results") or []:
+        for part in str(entry).split(","):
+            name = _clean_name(part)
+            if name:
+                found.add(name)
+    return found
+
+
+def _source_urlscan(domain, timeout, ctx):
+    """Enumerate via the urlscan.io search API (free, rate-limited)."""
+    q = urllib.parse.quote(domain, safe="")
+    url = "https://urlscan.io/api/v1/search/?q=domain:%s" % q
+    found = set()
+    data = _fetch_json_retry(url, timeout, ctx)
+    if not isinstance(data, dict):
+        return found
+    for result in data.get("results") or []:
+        page = result.get("page") if isinstance(result, dict) else None
+        name = _clean_name(page.get("domain") if isinstance(page, dict) else "")
+        if name:
+            found.add(name)
     return found
 
 
@@ -120,6 +214,9 @@ SOURCES = (
     ("crtsh", _source_crtsh),
     ("certspotter", _source_certspotter),
     ("hackertarget", _source_hackertarget),
+    ("otx", _source_otx),
+    ("bufferover", _source_bufferover),
+    ("urlscan", _source_urlscan),
 )
 
 
@@ -140,12 +237,12 @@ def normalize(subs, domain):
 # alive checks
 # ---------------------------------------------------------------------------
 
-def _check_alive(host, timeout=ALIVE_TIMEOUT):
+def _check_alive(host, timeout=ALIVE_TIMEOUT, ctx=None):
     """Try https://host then http://host. Returns (alive, scheme, status, final_url)."""
     for scheme in ("https", "http"):
         try:
             status, _headers, _body, final_url = fetch(
-                "%s://%s" % (scheme, host), timeout=timeout
+                "%s://%s" % (scheme, host), timeout=timeout, ctx=ctx
             )
         except Exception:
             status, final_url = 0, None
@@ -158,13 +255,13 @@ def _check_alive(host, timeout=ALIVE_TIMEOUT):
 # subdomain-takeover triage
 # ---------------------------------------------------------------------------
 
-def _doh_cname(host, timeout=DOH_TIMEOUT):
+def _doh_cname(host, timeout=DOH_TIMEOUT, ctx=None):
     """Return the CNAME target for host via DNS-over-HTTPS, or None."""
     url = "%s?name=%s&type=CNAME" % (
         DOH_URL, urllib.parse.quote(host, safe="")
     )
     try:
-        status, _headers, body, _final = fetch(url, timeout=timeout)
+        status, _headers, body, _final = fetch(url, timeout=timeout, ctx=ctx)
     except Exception:
         return None
     if status != 200 or not body:
@@ -200,9 +297,9 @@ def _resolves(name, timeout=5):
         return False
 
 
-def _takeover_candidate(host, timeout=DOH_TIMEOUT):
+def _takeover_candidate(host, timeout=DOH_TIMEOUT, ctx=None):
     """Return the dangling CNAME target if host looks takeable, else None."""
-    cname = _doh_cname(host, timeout)
+    cname = _doh_cname(host, timeout, ctx)
     if not cname:
         return None
     if not any(
@@ -254,7 +351,7 @@ def run(target, ctx):
     source_timeout = config.get("recon_source_timeout", SOURCE_TIMEOUT)
     for key, func in SOURCES:
         try:
-            got = func(domain, source_timeout)
+            got = func(domain, source_timeout, ctx)
         except Exception as exc:  # one source must not kill the run
             _log("warning", "recon: source %s failed: %s" % (key, exc))
             continue
@@ -269,7 +366,7 @@ def run(target, ctx):
         if not _in_scope(host):
             continue
         try:
-            ok, scheme, status, final_url = _check_alive(host, ALIVE_TIMEOUT)
+            ok, scheme, status, final_url = _check_alive(host, ALIVE_TIMEOUT, ctx)
         except Exception as exc:  # never let one host kill the run
             _log("debug", "recon: alive check for %s failed: %s" % (host, exc))
             continue
@@ -307,7 +404,7 @@ def run(target, ctx):
         if not _in_scope(host):
             continue
         try:
-            cname = _takeover_candidate(host, DOH_TIMEOUT)
+            cname = _takeover_candidate(host, DOH_TIMEOUT, ctx)
         except Exception as exc:
             _log("debug", "recon: takeover check for %s failed: %s" % (host, exc))
             continue

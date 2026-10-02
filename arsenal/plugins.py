@@ -10,7 +10,10 @@ import os
 
 PLUGIN_DIR = os.path.expanduser("~/.arsenal/plugins")
 
+# The 4-attribute contract every plugin must satisfy. INTRUSIVE is
+# optional (defaults to False) but strongly recommended.
 _REQUIRED_ATTRS = ("NAME", "DESCRIPTION", "TARGET_KIND", "run")
+_OPTIONAL_ATTRS = ("INTRUSIVE", "VERSION", "AUTHOR")
 
 
 def load_plugins():
@@ -37,9 +40,34 @@ def load_plugins():
             continue
         if not callable(getattr(mod, "run", None)):
             continue
+        # Normalize the optional INTRUSIVE flag so the pipeline can read it.
+        if not hasattr(mod, "INTRUSIVE"):
+            mod.INTRUSIVE = False
         mod.__plugin_path__ = path
         plugins[mod.NAME] = mod
     return plugins
+
+
+def plugins_for_kind(kind):
+    """Return {NAME: module} for plugins with the given TARGET_KIND."""
+    wanted = str(kind or "").lower()
+    return {name: mod for name, mod in load_plugins().items()
+            if str(getattr(mod, "TARGET_KIND", "")).lower() == wanted}
+
+
+def validate_plugin(mod):
+    """Check a plugin module against the contract. Returns [problems]."""
+    problems = []
+    for attr in _REQUIRED_ATTRS:
+        if not hasattr(mod, attr):
+            problems.append("missing required attribute: %s" % attr)
+    if hasattr(mod, "run") and not callable(mod.run):
+        problems.append("run is not callable")
+    kind = str(getattr(mod, "TARGET_KIND", "")).lower()
+    if kind and kind not in ("domain", "url", "ip", "hash", "path",
+                             "keyword", "token"):
+        problems.append("unknown TARGET_KIND %r" % kind)
+    return problems
 
 
 def add_parsers(subparsers):

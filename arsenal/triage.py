@@ -1,17 +1,37 @@
-"""AI TRIAGE ANALYST for PENTRIX ARSENAL.
+"""AI TRIAGE ANALYST for PENTRIX ARSENAL (v2).
 
 triage_finding() enriches a finding dict with an analyst verdict, reasoning,
-concrete next steps and a draft report section. It uses the LLM provider when
-an API key is configured and falls back to a rule-based analyst otherwise.
-Library functions never print; the CLI entry points below may.
+concrete next steps and a draft report section. triage_all() adds the v2
+pipeline around it:
+
+* deduplication: findings with identical fingerprints (kind+host+param+
+  evidence hash, via arsenal.dupcheck) collapse before any LLM call;
+* batched LLM triage: findings are grouped into a few LLM calls instead
+  of one call per finding, with a cost guard (llm.max_calls /
+  llm.max_tokens) that falls back to rules when exhausted;
+* FP feedback learning: analyst "false positive" verdicts are stored in
+  the workspace (fp_feedback.json) and auto-suppress similar future
+  findings with the reason attached;
+* evidence-chained verdicts: every verdict carries the evidence excerpts
+  it rests on.
+
+It uses the configured LLM provider when a key is available and falls
+back to a rule-based analyst otherwise. Library functions never print;
+the CLI entry points below may.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 
 from arsenal import llm
+
+try:
+    from arsenal import dupcheck as dupcheck_mod
+except Exception:
+    dupcheck_mod = None
 
 try:  # optional normalizer provided by another builder; never required here
     from arsenal.findings import make_finding  # noqa: F401
@@ -21,8 +41,25 @@ except Exception:  # findings module not present yet
 
 VALID_VERDICTS = ("exploitable", "needs_manual_review", "likely_false_positive")
 
-# Modules whose detections are classic, directly exploitable vulnerability classes.
-_EXPLOITABLE_CLASSES = {"xss", "sqli", "ssrf", "rce", "lfi", "idor", "auth-bypass"}
+# Modules whose detections are classic, directly exploitable vulnerability
+# classes. Computed from modules that actually exist so the set never
+# references dead modules (Crew B may add ssrf/lfi/idor later; they join
+# automatically once importable).
+_KNOWN_EXPLOITABLE = ("xss", "sqli", "ssrf", "rce", "lfi", "idor", "auth-bypass")
+
+
+def _existing_modules():
+    try:
+        from arsenal.modules import REGISTRY
+        return set(REGISTRY)
+    except Exception:
+        return set()
+
+
+def _exploitable_classes():
+    return {m for m in _KNOWN_EXPLOITABLE if m in _existing_modules()}
+
+
 # Recon-style modules whose raw output is frequently benign in isolation.
 _RECON_MODULES = {"wordlist", "tech"}
 
@@ -78,7 +115,7 @@ def _ws_call(ws, method: str, target, default=None):
         return default
     fn = getattr(ws, method, None)
     if not callable(fn):
-        for alt in _WS_ALIASES.get(method, ()): 
+        for alt in _WS_ALIASES.get(method, ()):
             fn = getattr(ws, alt, None)
             if callable(fn):
                 break
@@ -93,6 +130,95 @@ def _ws_call(ws, method: str, target, default=None):
             return default
     except Exception:
         return default
+
+
+def _workspace_root(ctx) -> str:
+    ws = getattr(ctx, "workspace", None)
+    if ws is not None:
+        for attr in ("root", "base", "dir", "basedir"):
+            val = getattr(ws, attr, None)
+            if isinstance(val, str) and val:
+                return os.path.expanduser(val)
+        if hasattr(ws, "path"):
+            try:
+                probe = ws.path("__probe__")
+                return os.path.dirname(probe.rstrip(os.sep))
+            except Exception:
+                pass
+    extra = getattr(ctx, "workspaces_root", None)
+    if extra:
+        return os.path.expanduser(str(extra))
+    return os.path.expanduser(os.path.join("~", ".arsenal", "workspaces"))
+
+
+def _fp_path(ctx) -> str:
+    return os.path.join(_workspace_root(ctx), "fp_feedback.json")
+
+
+def _load_fp_store(ctx) -> dict:
+    path = _fp_path(ctx)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_fp_store(ctx, store: dict) -> bool:
+    path = _fp_path(ctx)
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def record_fp_verdict(finding: dict, ctx, analyst_note="") -> bool:
+    """Store an analyst "false positive" verdict for a finding's fingerprint.
+
+    Future findings with a matching fingerprint are auto-suppressed by
+    triage_all with the reason attached. Returns True when stored.
+    """
+    if dupcheck_mod is None or not isinstance(finding, dict):
+        return False
+    fp = dupcheck_mod.fingerprint(finding)
+    store = _load_fp_store(ctx)
+    from datetime import datetime, timezone
+    store[fp] = {
+        "verdict": "false_positive",
+        "title": str(finding.get("title", ""))[:160],
+        "module": str(finding.get("module", "")),
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "note": str(analyst_note or "")[:300],
+    }
+    return _save_fp_store(ctx, store)
+
+
+def known_fp(finding: dict, ctx):
+    """Return the stored FP record for a finding, or None."""
+    if dupcheck_mod is None or not isinstance(finding, dict):
+        return None
+    return _load_fp_store(ctx).get(dupcheck_mod.fingerprint(finding))
+
+
+def _evidence_chain(finding: dict, limit: int = 3):
+    """Extract the evidence excerpts a verdict should rest on."""
+    chain = []
+    for key in ("evidence", "payload", "request", "response_snippet"):
+        val = str(finding.get(key) or "").strip()
+        if val:
+            excerpt = val if len(val) <= 280 else val[:277] + "..."
+            chain.append({"field": key, "excerpt": excerpt})
+        if len(chain) >= limit:
+            break
+    return chain
 
 
 # --------------------------------------------------------------------------
@@ -123,18 +249,6 @@ _MODULE_STEPS = {
         "Test a time-based probe to distinguish a real injection from coincidental response differences.",
         "Verify the query runs in a security-relevant context (authentication, authorization, or data access) before escalating.",
     ],
-    "ssrf": [
-        "Point the suspect parameter at a collaborator URL you control and confirm an outbound request arrives.",
-        "Probe cloud metadata endpoints (e.g. 169.254.169.254) only where in scope and stop at confirmation of reachability.",
-        "Check whether the response leaks fetched content, which separates blind SSRF from full-response SSRF.",
-        "Test available URL schemes and redirect behavior to map the filter, if any.",
-    ],
-    "idor": [
-        "Swap the object identifier for one belonging to a second test account and confirm unauthorized access.",
-        "Test both sequential and UUID-style identifiers to map the authorization check coverage.",
-        "Verify whether read access, write access, or both are affected; write impact raises severity.",
-        "Check that no additional server-side check (signature, ownership token) blocks the request in some paths.",
-    ],
     "wordlist": [
         "Manually request the discovered path and record the exact status code, content length, and content type.",
         "Compare against a known-missing path baseline to rule out wildcard/soft-404 responses.",
@@ -161,10 +275,6 @@ _MODULE_IMPACT = {
             "This typically enables session theft, account takeover, or defacement depending on the application's trust model."),
     "sqli": ("An attacker can manipulate backend database queries through the vulnerable parameter. "
              "Depending on the database privileges this can lead to data exfiltration, authentication bypass, or full host compromise."),
-    "ssrf": ("The server can be made to issue requests to internal or external resources on the attacker's behalf. "
-             "This can expose internal services and cloud metadata, and may enable further pivoting."),
-    "idor": ("An attacker can access or modify objects belonging to other users by manipulating identifiers. "
-             "Impact ranges from privacy violations to data tampering depending on the object's sensitivity."),
     "wordlist": ("The discovered path may expose functionality or files not linked from the main application. "
                  "On its own this is usually informational, but it can reveal an enlarged attack surface worth investigating."),
     "tech": ("Knowing the exact technology stack helps an attacker select targeted exploits. "
@@ -177,7 +287,7 @@ def _rule_verdict(finding: dict):
     conf = _s(finding.get("confidence"))
     module = _s(finding.get("module"))
 
-    if sev == "high" and module in _EXPLOITABLE_CLASSES:
+    if sev == "high" and module in _exploitable_classes():
         return (
             "exploitable",
             "High severity %s finding with %s confidence. This module detects a classic directly-exploitable "
@@ -193,8 +303,6 @@ def _rule_verdict(finding: dict):
         probe = {
             "xss": "confirm the reflection context with a benign payload",
             "sqli": "confirm with a boolean-based probe and compare responses",
-            "ssrf": "confirm with a collaborator callback URL",
-            "idor": "confirm with a second test account's object identifier",
         }.get(module, "reproduce the finding manually and capture full request/response evidence")
         return (
             "needs_manual_review",
@@ -271,26 +379,33 @@ def _rule_triage(finding: dict) -> dict:
     return {
         "verdict": verdict,
         "triage_reason": reason,
+        "evidence_chain": _evidence_chain(finding),
         "next_steps": next_steps,
         "report_section": _report_section(finding, verdict),
     }
 
 
 # --------------------------------------------------------------------------
-# LLM-based triage
+# LLM-based triage (batched, cost-guarded)
 # --------------------------------------------------------------------------
 
 _TRIAGE_SYSTEM = (
-    "You are a senior bug bounty triage analyst. Given a scanner finding as JSON, "
-    "assess it like a human analyst. Respond with STRICT JSON only, no markdown, "
-    "no commentary, with exactly these keys: "
-    '{"verdict": "exploitable|needs_manual_review|likely_false_positive", '
-    '"triage_reason": "2-3 sentence analyst reasoning", '
+    "You are a senior bug bounty triage analyst. Given a JSON array of scanner "
+    "findings, assess each like a human analyst and chain your verdict to the "
+    "quoted evidence: reference the specific evidence excerpt that supports "
+    "each verdict. Respond with STRICT JSON only, no markdown, no commentary: "
+    '{"results": [{"index": 0, "verdict": '
+    '"exploitable|needs_manual_review|likely_false_positive", '
+    '"triage_reason": "2-3 sentence analyst reasoning citing the evidence", '
     '"next_steps": ["2-4 concrete manual verification commands or checks"], '
     '"report_section": {"title": "professional report title", '
     '"impact": "two-sentence business impact", '
-    '"reproduction": ["numbered reproduction steps"]}}'
+    '"reproduction": ["numbered reproduction steps"]}}]}'
+    " Keep every triage_reason evidence-chained: quote or name the evidence "
+    "excerpt you relied on."
 )
+
+_BATCH_SIZE = 8
 
 
 def _extract_json(raw: str) -> dict:
@@ -327,6 +442,7 @@ def _normalize_llm_result(data: dict, finding: dict) -> dict:
     return {
         "verdict": verdict,
         "triage_reason": str(data.get("triage_reason") or "LLM triage provided no reasoning."),
+        "evidence_chain": _evidence_chain(finding),
         "next_steps": [str(s) for s in next_steps][:6],
         "report_section": {
             "title": str(section["title"]),
@@ -336,13 +452,47 @@ def _normalize_llm_result(data: dict, finding: dict) -> dict:
     }
 
 
-def _llm_triage(finding: dict, ctx) -> dict:
+def _finding_payload(finding: dict) -> dict:
+    """Compact finding dict for the LLM prompt (evidence-chained)."""
+    payload = {
+        "module": finding.get("module"),
+        "severity": finding.get("severity"),
+        "confidence": finding.get("confidence"),
+        "title": finding.get("title"),
+        "description": str(finding.get("description") or "")[:800],
+        "target": finding.get("target"),
+        "url": finding.get("url"),
+        "param": finding.get("param"),
+    }
+    chain = _evidence_chain(finding)
+    if chain:
+        payload["evidence_chain"] = chain
+    return payload
+
+
+def _llm_triage_batch(batch, ctx, guard) -> dict:
+    """Triage one batch with a single LLM call. Returns {idx: result}."""
+    items = [{"index": i, "finding": _finding_payload(f)} for i, f in enumerate(batch)]
     messages = [
         {"role": "system", "content": _TRIAGE_SYSTEM},
-        {"role": "user", "content": json.dumps(finding, indent=2, default=str)[:6000]},
+        {"role": "user", "content": json.dumps(items, indent=1, default=str)[:12000]},
     ]
-    raw = llm.chat(messages, max_tokens=800, timeout=30, ctx=ctx)
-    return _normalize_llm_result(_extract_json(raw), finding)
+    raw = llm.chat(messages, max_tokens=guard["max_tokens"], timeout=45, ctx=ctx)
+    data = _extract_json(raw)
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise ValueError("LLM batch response missing 'results' list")
+    out = {}
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        idx = entry.get("index")
+        if not isinstance(idx, int) or not (0 <= idx < len(batch)):
+            continue
+        out[idx] = _normalize_llm_result(entry, batch[idx])
+    if not out:
+        raise ValueError("LLM batch response contained no usable results")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -351,13 +501,33 @@ def _llm_triage(finding: dict, ctx) -> dict:
 
 def triage_finding(finding: dict, ctx) -> dict:
     """Triage one finding; returns a copy enriched with verdict, triage_reason,
-    next_steps and report_section. Uses the LLM when available, rules otherwise.
-    Never raises for a single finding: LLM failures fall back to rules."""
+    evidence_chain, next_steps and report_section. Uses the LLM when
+    available, rules otherwise. Never raises for a single finding: LLM
+    failures fall back to rules."""
     finding = dict(finding) if isinstance(finding, dict) else {"raw": str(finding)}
+    # FP feedback: a stored analyst verdict wins over everything.
+    fp_record = known_fp(finding, ctx)
+    if fp_record:
+        finding.update({
+            "verdict": "likely_false_positive",
+            "triage_reason": (
+                "Auto-suppressed: an analyst previously marked this finding a "
+                "false positive%s."
+                % (" (%s)" % fp_record.get("note") if fp_record.get("note") else "")
+            ),
+            "evidence_chain": _evidence_chain(finding),
+            "next_steps": ["No action needed unless the underlying behavior changed."],
+            "report_section": _report_section(finding, "likely_false_positive"),
+            "fp_suppressed": True,
+        })
+        finding["triaged"] = True
+        return finding
     result = None
     if llm.llm_available():
         try:
-            result = _llm_triage(finding, ctx)
+            guard = llm.cost_guard(ctx)
+            batch_result = _llm_triage_batch([finding], ctx, guard)
+            result = batch_result.get(0)
         except Exception as e:
             _log(ctx, "warning", "LLM triage failed (%s); falling back to rules." % e)
             result = None
@@ -369,35 +539,146 @@ def triage_finding(finding: dict, ctx) -> dict:
 
 
 def triage_all(findings, ctx):
-    """Triage every finding; per-finding errors are caught and logged so one
-    bad record never aborts the run."""
+    """Triage every finding with dedup, batching and a cost guard.
+
+    Steps: (1) collapse duplicate fingerprints, (2) auto-suppress stored
+    analyst FPs, (3) batch the rest into few LLM calls (cost guard caps
+    the calls; overflow falls back to rules), (4) per-finding errors are
+    caught and logged so one bad record never aborts the run.
+    """
+    findings = [f for f in (findings or []) if isinstance(f, dict)]
+    if dupcheck_mod is not None:
+        unique, dups = dupcheck_mod.dedupe_findings(findings)
+    else:
+        unique, dups = list(findings), []
+
+    guard = llm.cost_guard(ctx)
+    calls_used = [0]
     out = []
-    for f in findings or []:
-        try:
-            out.append(triage_finding(f, ctx))
-        except Exception as e:  # defensive: triage_finding should not raise
-            title = f.get("title") if isinstance(f, dict) else f
-            _log(ctx, "error", "Triage failed for %r: %s" % (title, e))
-            fb = dict(f) if isinstance(f, dict) else {"raw": str(f)}
-            fb.update(
-                {
-                    "verdict": "needs_manual_review",
-                    "triage_reason": "Automated triage raised an error; manual review required.",
-                    "next_steps": ["Reproduce the finding manually and re-run triage."],
-                    "report_section": {
-                        "title": str(title or "Untriaged finding"),
-                        "impact": "Impact could not be assessed automatically; determine it during manual review.",
-                        "reproduction": ["1. Reproduce the finding manually and capture full evidence."],
-                    },
-                    "triaged": True,
-                }
-            )
-            out.append(fb)
+
+    def triage_one(f):
+        # FP feedback short-circuit (no LLM spend on known FPs).
+        fp_record = known_fp(f, ctx)
+        if fp_record:
+            fb = dict(f)
+            fb.update({
+                "verdict": "likely_false_positive",
+                "triage_reason": (
+                    "Auto-suppressed: an analyst previously marked this finding a "
+                    "false positive%s."
+                    % (" (%s)" % fp_record.get("note") if fp_record.get("note") else "")
+                ),
+                "evidence_chain": _evidence_chain(fb),
+                "next_steps": ["No action needed unless the underlying behavior changed."],
+                "report_section": _report_section(fb, "likely_false_positive"),
+                "fp_suppressed": True,
+                "triaged": True,
+            })
+            return fb
+        return None
+
+    # Collect findings needing LLM work; FP-suppressed ones are done now.
+    pending = []
+    for f in unique:
+        done = triage_one(f)
+        if done is not None:
+            out.append(done)
+        else:
+            pending.append(f)
+
+    llm_ok = llm.llm_available()
+    guard_hit_logged = [False]
+    if llm_ok and pending:
+        batches = [pending[i:i + _BATCH_SIZE]
+                   for i in range(0, len(pending), _BATCH_SIZE)]
+        for batch in batches:
+            if calls_used[0] >= guard["max_calls"]:
+                if not guard_hit_logged[0]:
+                    _log(ctx, "warning",
+                         "LLM cost guard hit (%d calls); triaging the rest with rules."
+                         % guard["max_calls"])
+                    guard_hit_logged[0] = True
+                for f in batch:
+                    fb = dict(f)
+                    fb.update(_rule_triage(fb))
+                    fb["triaged"] = True
+                    fb["triage_rules_fallback"] = "cost_guard"
+                    out.append(fb)
+                continue
+            try:
+                calls_used[0] += 1
+                results = _llm_triage_batch(batch, ctx, guard)
+                for i, f in enumerate(batch):
+                    fb = dict(f)
+                    res = results.get(i)
+                    if res is None:
+                        res = _rule_triage(fb)
+                        fb["triage_rules_fallback"] = "batch_gap"
+                    fb.update(res)
+                    fb["triaged"] = True
+                    out.append(fb)
+            except Exception as e:
+                _log(ctx, "warning",
+                     "LLM batch triage failed (%s); falling back to rules." % e)
+                for f in batch:
+                    fb = dict(f)
+                    fb.update(_rule_triage(fb))
+                    fb["triaged"] = True
+                    fb["triage_rules_fallback"] = "llm_error"
+                    out.append(fb)
+
+    if not llm_ok:
+        for f in pending:
+            try:
+                fb = dict(f)
+                fb.update(_rule_triage(fb))
+                fb["triaged"] = True
+                out.append(fb)
+            except Exception as e:
+                title = f.get("title")
+                _log(ctx, "error", "Triage failed for %r: %s" % (title, e))
+                out.append(_triage_error_fallback(f))
+
+    # Re-attach collapsed duplicates with a pointer to the survivor.
+    for d in dups:
+        fb = dict(d)
+        fb.update({
+            "verdict": "likely_false_positive",
+            "triage_reason": "Collapsed as a duplicate of an identical finding "
+                             "(fingerprint %s); triage the surviving record."
+                             % str(d.get("duplicate_of", "?"))[:12],
+            "evidence_chain": _evidence_chain(fb),
+            "next_steps": [],
+            "report_section": _report_section(fb, "likely_false_positive"),
+            "triaged": True,
+            "is_duplicate": True,
+        })
+        out.append(fb)
     return out
 
 
+def _triage_error_fallback(f):
+    title = f.get("title") if isinstance(f, dict) else f
+    fb = dict(f) if isinstance(f, dict) else {"raw": str(f)}
+    fb.update(
+        {
+            "verdict": "needs_manual_review",
+            "triage_reason": "Automated triage raised an error; manual review required.",
+            "evidence_chain": _evidence_chain(fb),
+            "next_steps": ["Reproduce the finding manually and re-run triage."],
+            "report_section": {
+                "title": str(title or "Untriaged finding"),
+                "impact": "Impact could not be assessed automatically; determine it during manual review.",
+                "reproduction": ["1. Reproduce the finding manually and capture full evidence."],
+            },
+            "triaged": True,
+        }
+    )
+    return fb
+
+
 # --------------------------------------------------------------------------
-# CLI: arsenal triage <target>
+# CLI: arsenal triage <target> [--mark-fp F-001]
 # --------------------------------------------------------------------------
 
 def _stored_findings(ws, target):
@@ -442,6 +723,21 @@ def cmd_triage(args, ctx):
     if not findings:
         print("No stored findings for target %r." % args.target)
         return 0
+    if getattr(args, "mark_fp", None):
+        wanted = str(args.mark_fp).upper()
+        match = next((f for f in findings
+                      if str(f.get("id", "")).upper() == wanted), None)
+        if match is None:
+            print("No finding %s stored for %r." % (args.mark_fp, args.target))
+            return 1
+        note = getattr(args, "fp_note", "") or ""
+        if record_fp_verdict(match, ctx, analyst_note=note):
+            print("Recorded false-positive feedback for %s (%s). Future "
+                  "matching findings will be auto-suppressed."
+                  % (wanted, match.get("title", "")[:60]))
+            return 0
+        print("Could not store FP feedback (workspace unavailable).")
+        return 1
     triaged = triage_all(findings, ctx)
     saved = _store_findings(ws, args.target, triaged)
     counts = {}
@@ -458,6 +754,12 @@ def cmd_triage(args, ctx):
         table.add_column("Count", justify="right")
         for v in VALID_VERDICTS:
             table.add_row(v, str(counts.get(v, 0)))
+        n_dup = sum(1 for f in triaged if f.get("is_duplicate"))
+        n_fp = sum(1 for f in triaged if f.get("fp_suppressed"))
+        if n_dup:
+            table.add_row("[dim]duplicates collapsed[/dim]", str(n_dup))
+        if n_fp:
+            table.add_row("[dim]FP auto-suppressed[/dim]", str(n_fp))
         console.print(table)
     except Exception:
         print("Triage results for %s:" % args.target)
@@ -471,6 +773,10 @@ def cmd_triage(args, ctx):
 def add_parsers(sub):
     p = sub.add_parser("triage", help="AI-triage the stored findings for a target")
     p.add_argument("target", help="Target identifier (as stored in the workspace)")
+    p.add_argument("--mark-fp", metavar="FID", default=None,
+                   help="Record finding FID as a false positive (teaches future triage)")
+    p.add_argument("--fp-note", default="",
+                   help="Analyst note stored with the false-positive verdict")
     p.set_defaults(func=cmd_triage)
     return p
 

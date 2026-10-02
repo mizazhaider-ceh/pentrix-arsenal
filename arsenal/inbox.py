@@ -188,3 +188,129 @@ def dispatch(args, ctx):
     if callable(func):
         return func(args, ctx)
     raise ValueError("no command dispatch configured for inbox")
+
+# ---------------------------------------------------------------------------
+# TOKEN REGISTRY + POLLING API (added for the OOB correlation engine).
+#
+# arsenal.oob mints a unique token per payload and registers it here with
+# the metadata of the exact request that carries it. When a callback lands
+# in the inbox, poll_hits() + match_hits() link it back to that request.
+# Registry lives in ~/.arsenal/oob_registry.json (survives restarts).
+# ---------------------------------------------------------------------------
+
+import secrets as _secrets
+
+REGISTRY_FILE = INBOX_DIR / "oob_registry.json"
+
+
+def mint_token(prefix="ax") -> str:
+    """Mint a unique, low-collision OOB token."""
+    return "%s-%s" % (prefix, _secrets.token_urlsafe(9))
+
+
+def _read_registry() -> dict:
+    if not REGISTRY_FILE.exists():
+        return {}
+    try:
+        with REGISTRY_FILE.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_registry(reg: dict) -> None:
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = REGISTRY_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(reg, fh, indent=2, ensure_ascii=False)
+    tmp.replace(REGISTRY_FILE)
+
+
+def register_token(token: str, meta: dict) -> None:
+    """Register a minted token with the request metadata that carries it.
+
+    meta should include: vuln_class, target, param, method, url,
+    payload, ts, note.
+    """
+    reg = _read_registry()
+    entry = dict(meta or {})
+    entry.setdefault("token", token)
+    entry.setdefault("ts", _dt.datetime.now(_dt.timezone.utc).isoformat())
+    entry.setdefault("matched", False)
+    reg[token] = entry
+    _write_registry(reg)
+
+
+def lookup_token(token: str):
+    """Return the registry entry for a token, or None."""
+    return _read_registry().get(token)
+
+
+def list_tokens(only_unmatched=False) -> list[dict]:
+    reg = _read_registry()
+    entries = list(reg.values())
+    if only_unmatched:
+        entries = [e for e in entries if not e.get("matched")]
+    return sorted(entries, key=lambda e: e.get("ts", ""))
+
+
+def mark_matched(token: str, hit: dict) -> None:
+    reg = _read_registry()
+    if token in reg:
+        reg[token]["matched"] = True
+        reg[token]["matched_hit"] = {
+            "ts": hit.get("ts"), "method": hit.get("method"),
+            "path": hit.get("path"), "query": hit.get("query"),
+            "client": hit.get("client"),
+        }
+        _write_registry(reg)
+
+
+def poll_hits(since_ts: str | None = None, limit: int = 200) -> list[dict]:
+    """Return inbox hits, newest last, optionally only after since_ts
+    (ISO timestamp string)."""
+    hits = _read_hits(limit if limit else 5000)
+    if since_ts:
+        hits = [h for h in hits if str(h.get("ts", "")) >= since_ts]
+    return hits
+
+
+def match_hits(hits: list[dict]) -> list[tuple[dict, dict]]:
+    """Link inbox hits to registered tokens.
+
+    A hit matches when a registered token appears in its path, query,
+    body, or headers. Returns [(hit, registry_entry), ...]; matched
+    tokens are marked once and never reported twice.
+    """
+    reg = _read_registry()
+    if not reg:
+        return []
+    matches = []
+    dirty = False
+    for hit in hits:
+        haystacks = [
+            str(hit.get("path", "")),
+            str(hit.get("query", "")),
+            str(hit.get("body", "")),
+        ]
+        headers = hit.get("headers") or {}
+        haystacks.extend(str(v) for v in headers.values())
+        blob = "\n".join(haystacks)
+        for token, entry in reg.items():
+            if token and token in blob and not entry.get("matched"):
+                matches.append((hit, dict(entry)))
+                entry["matched"] = True
+                entry["matched_hit"] = {
+                    "ts": hit.get("ts"), "method": hit.get("method"),
+                    "path": hit.get("path"), "query": hit.get("query"),
+                    "client": hit.get("client"),
+                }
+                dirty = True
+    if dirty:
+        _write_registry(reg)
+    return matches
+
+
+def tokens_pending() -> int:
+    return len(list_tokens(only_unmatched=True))

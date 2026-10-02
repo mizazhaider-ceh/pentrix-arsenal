@@ -20,6 +20,7 @@ of the Live layout. Never crashes on missing data.
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -47,6 +48,9 @@ STAGE_ICON = {
     "done": ("[+]", "green"),
     "error": ("[!]", "red"),
 }
+
+# Pipeline v2 emits live finding events as "<title> [<severity>]".
+_FINDING_EVENT_RE = re.compile(r"^(.*)\s+\[([a-zA-Z]+)\]\s*$")
 
 
 def _profile(ctx) -> str:
@@ -146,6 +150,18 @@ def _progress(state: _State, stage, detail=None, done=False) -> None:
             return
     elif detail is not None:
         text = str(detail)
+    # Pipeline v2 live finding stream: "finding" events arrive as
+    # "<title> [<severity>]" strings; feed them into the live feed.
+    if stage == "finding" and text:
+        match = _FINDING_EVENT_RE.match(text)
+        if match:
+            _register_finding(state, {
+                "title": match.group(1).strip(),
+                "severity": match.group(2).strip().lower(),
+            })
+        state.stages[stage]["status"] = "running"
+        state.stages[stage]["detail"] = "%d finding(s) so far" % len(state.findings)
+        return
     if done:
         state.stages[stage]["status"] = "done"
     else:

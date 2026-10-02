@@ -8,10 +8,10 @@ Status key: **SHIPPED** (in this release) / **PLANNED** (on the list).
 | # | Idea | Status |
 |---|---|---|
 | 1 | Certificate transparency monitoring (new certs = early subdomain discovery) | SHIPPED |
-| 2 | Cloud asset discovery (buckets derived from target names) | PLANNED |
+| 2 | Cloud asset discovery (buckets derived from target names) | SHIPPED (v2.0.0: scopex.py) |
 | 3 | GitHub code search for org leaks | PLANNED |
 | 4 | Shodan/Censys integration for exposed services | PLANNED |
-| 5 | ASN and IP range expansion from known assets | PLANNED |
+| 5 | ASN and IP range expansion from known assets | SHIPPED (v2.0.0: scopex.py, BGPView/RIPEstat) |
 | 6 | Reverse WHOIS infrastructure mapping | PLANNED |
 | 7 | DNS history lookup (old A records to forgotten servers) | PLANNED |
 | 8 | Subdomain takeover detection (dangling CNAME auto-check) | SHIPPED |
@@ -25,25 +25,25 @@ Status key: **SHIPPED** (in this release) / **PLANNED** (on the list).
 | 11 | Nuclei template integration (run community templates through arsenal) | PLANNED |
 | 12 | Tech-aware smart fuzzing (payloads matched to detected stack) | SHIPPED |
 | 13 | Hidden parameter discovery | SHIPPED |
-| 14 | HTTP request smuggling checks | PLANNED |
+| 14 | HTTP request smuggling checks | SHIPPED (v2.0.0: smuggle_mod, raw-socket CL.TE/TE.CL) |
 | 15 | GraphQL introspection and exploitation helpers | SHIPPED |
-| 16 | WebSocket security testing | PLANNED |
+| 16 | WebSocket security testing | SHIPPED (v2.0.0: ws_mod, raw Upgrade handshake) |
 | 17 | JWT attack automation (none alg, weak secrets, jku/x5u) | SHIPPED |
 | 18 | OAuth/OIDC misconfiguration tester | SHIPPED |
 | 19 | Self-hosted SSRF callback listener (interactsh-style) | SHIPPED |
-| 20 | Blind XXE with out-of-band listener | PLANNED |
+| 20 | Blind XXE with out-of-band listener | SHIPPED (v2.0.0: xxe_mod + oob correlation engine) |
 | 21 | SSTI detection across template engines | SHIPPED |
 | 22 | Prototype pollution scanner | SHIPPED |
 | 23 | Cache poisoning and web cache deception checks | SHIPPED |
 | 24 | Host header injection tester | SHIPPED |
-| 25 | AI-generated business logic test scenarios per app type | PLANNED |
+| 25 | AI-generated business logic test scenarios per app type | SHIPPED (v2.0.0: business-logic.yaml workflow pack + ask-arsenal) |
 
 ## AI
 
 | # | Idea | Status |
 |---|---|---|
-| 26 | AI false-positive killer (re-examines findings with fresh eyes) | PLANNED |
-| 27 | AI payload mutator (adapts payloads to observed WAF behavior) | PLANNED |
+| 26 | AI false-positive killer (re-examines findings with fresh eyes) | SHIPPED (v2.0.0: FP feedback learning, rule-based + LLM) |
+| 27 | AI payload mutator (adapts payloads to observed WAF behavior) | SHIPPED (v2.0.0: mutate.py adaptive engine, 10 strategies) |
 | 28 | Platform-specific report writer (YesWeHack and HackerOne formats) | SHIPPED |
 | 29 | Natural language hunt queries over workspace data (`arsenal ask`) | SHIPPED |
 | 30 | Personal hunting profile (learns your best bug classes) | PLANNED |
@@ -68,7 +68,7 @@ Status key: **SHIPPED** (in this release) / **PLANNED** (on the list).
 | 39 | Team workspaces (shared findings) | PLANNED |
 | 40 | Time tracker (hours per target vs payout) | SHIPPED |
 | 41 | Goal tracker (monthly bounty targets) | SHIPPED |
-| 42 | Methodology templates (API testing, web app, mobile backend) | PLANNED |
+| 42 | Methodology templates (API testing, web app, mobile backend) | SHIPPED (v2.0.0: workflows + docs) |
 
 ## Reporting
 
@@ -91,7 +91,7 @@ Status key: **SHIPPED** (in this release) / **PLANNED** (on the list).
 
 | # | Idea | Status |
 |---|---|---|
-| 50 | Crowdsourced report template library per bug class | PLANNED |
+| 50 | Crowdsourced report template library per bug class | SHIPPED (v2.0.0: arsenal templates) |
 
 ## Distilled from the community's best bounty tooling
 

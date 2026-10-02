@@ -18,6 +18,18 @@ confidence; verify_all(findings, ctx) applies it to a list. Rules:
   becomes "strong".
 - graphql_mod: when the evidence contains schema data (__schema),
   confidence becomes "proven".
+- ssrf_mod: replays the evidence "Request:" URL; when cloud metadata
+  markers appear in the response, or a "Callback-Tag:" inbox hit is
+  recorded, confidence becomes "proven".
+- lfi_mod: replays the evidence "Request:" URL; when a file canary
+  (root:x:0:0, [extensions]) appears, or a "Callback-Tag:" inbox hit
+  is recorded, confidence becomes "proven".
+- xxe_mod: replays the evidence "Payload:" via POST; when the passwd
+  canary appears, or a "Callback-Tag:" inbox hit is recorded,
+  confidence becomes "proven".
+- idor_mod: re-fetches the evidence "Baseline-URL:" and "Variant-URL:";
+  when both still return 200 with different content, confidence
+  becomes "strong".
 - Everything else keeps its existing confidence, defaulting to "review"
   when none is set.
 
@@ -25,7 +37,10 @@ Standard library only. Never raises on a single bad finding: failures
 leave the finding's confidence untouched.
 """
 
+import hashlib
+import json
 import urllib.parse
+from pathlib import Path
 
 from arsenal.http import fetch
 
@@ -35,6 +50,12 @@ EVIL_HOST = "evil.example.com"
 MAX_HOPS = 3
 
 DBMS_LABELS = ("MySQL", "PostgreSQL", "MSSQL", "Oracle", "SQLite")
+
+SSRF_METADATA_MARKERS = (
+    "ami-id", "instance-id", "computeMetadata", "Metadata-Flavor",
+    "metadata.google.internal",
+)
+LFI_CANARIES = ("root:x:0:0", "root:*:0:0", "[extensions]", "[fonts]")
 
 
 def _timeout(ctx):
@@ -163,6 +184,133 @@ def _verify_graphql(finding, ctx):
     return finding.get("confidence") or "review"
 
 
+def _request_line_url(evidence):
+    """Extract the replay URL from an evidence "Request:" line."""
+    for line in (evidence or "").splitlines():
+        if line.startswith("Request: "):
+            url = line[len("Request: "):].strip()
+            if url.startswith("POST "):
+                url = url[len("POST "):].strip()
+            return url.split(" ")[0]
+    return ""
+
+
+def _callback_tag(evidence):
+    for line in (evidence or "").splitlines():
+        if line.startswith("Callback-Tag: "):
+            return line[len("Callback-Tag: "):].strip()
+    return ""
+
+
+def _inbox_has_hit(tag):
+    """True when the local arsenal inbox recorded a hit for tag."""
+    if not tag:
+        return False
+    path = Path.home() / ".arsenal" / "inbox.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return False
+    for line in lines[-200:]:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        hay = "%s %s" % (rec.get("path", ""), rec.get("query", ""))
+        if tag in hay:
+            return True
+    return False
+
+
+def _body_text(resp):
+    if resp is None:
+        return ""
+    _status, _headers, body, _final = resp
+    try:
+        return (body or b"").decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _verify_ssrf(finding, ctx):
+    """Replay the SSRF probe; prove fetched metadata or a callback hit."""
+    evidence = finding.get("evidence") or ""
+    if _inbox_has_hit(_callback_tag(evidence)):
+        return "proven"
+    url = _request_line_url(evidence)
+    if not url:
+        return None
+    text = _body_text(_fetch(url, ctx))
+    if any(m in text for m in SSRF_METADATA_MARKERS):
+        return "proven"
+    return None
+
+
+def _verify_lfi(finding, ctx):
+    """Replay the LFI probe; prove canary content or a callback hit."""
+    evidence = finding.get("evidence") or ""
+    if _inbox_has_hit(_callback_tag(evidence)):
+        return "proven"
+    url = _request_line_url(evidence)
+    if not url:
+        return None
+    text = _body_text(_fetch(url, ctx))
+    if any(m in text for m in LFI_CANARIES):
+        return "proven"
+    return None
+
+
+def _verify_xxe(finding, ctx):
+    """Re-POST the XXE payload; prove canary content or a callback hit."""
+    evidence = finding.get("evidence") or ""
+    if _inbox_has_hit(_callback_tag(evidence)):
+        return "proven"
+    url = _request_line_url(evidence)
+    payload = ""
+    for line in evidence.splitlines():
+        if line.startswith("Payload: "):
+            payload = line[len("Payload: "):].strip()
+            break
+    if not url or not payload:
+        return None
+    try:
+        resp = fetch(url, method="POST", timeout=_timeout(ctx),
+                     headers={"Content-Type": "application/xml"},
+                     data=payload.encode("utf-8"),
+                     allow_redirects=True, ctx=ctx)
+    except Exception:
+        return None
+    if "root:x:0:0" in _body_text(resp):
+        return "proven"
+    return None
+
+
+def _fp_resp(resp):
+    if resp is None:
+        return (0, 0, "")
+    status, _h, body, _f = resp
+    body = body or b""
+    return (status, len(body), hashlib.sha256(body).hexdigest()[:16])
+
+
+def _verify_idor(finding, ctx):
+    """Re-fetch baseline and variant; confirm the differential persists."""
+    evidence = finding.get("evidence") or ""
+    baseline_url, variant_url = "", ""
+    for line in evidence.splitlines():
+        if line.startswith("Baseline-URL: "):
+            baseline_url = line[len("Baseline-URL: "):].strip()
+        elif line.startswith("Variant-URL: "):
+            variant_url = line[len("Variant-URL: "):].strip()
+    if not baseline_url or not variant_url:
+        return None
+    b_fp = _fp_resp(_fetch(baseline_url, ctx))
+    v_fp = _fp_resp(_fetch(variant_url, ctx))
+    if b_fp[0] == 200 and v_fp[0] == 200 and b_fp[2] != v_fp[2]:
+        return "strong"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -193,6 +341,18 @@ def _verify_finding(finding, ctx):
         finding["confidence"] = _verify_sqli(finding, ctx)
     elif module == "graphql_mod":
         finding["confidence"] = _verify_graphql(finding, ctx)
+    elif module in ("ssrf", "ssrf_mod"):
+        proven = _verify_ssrf(finding, ctx)
+        finding["confidence"] = proven or finding.get("confidence") or "review"
+    elif module in ("lfi", "lfi_mod"):
+        proven = _verify_lfi(finding, ctx)
+        finding["confidence"] = proven or finding.get("confidence") or "review"
+    elif module in ("xxe", "xxe_mod"):
+        proven = _verify_xxe(finding, ctx)
+        finding["confidence"] = proven or finding.get("confidence") or "review"
+    elif module in ("idor", "idor_mod"):
+        proven = _verify_idor(finding, ctx)
+        finding["confidence"] = proven or finding.get("confidence") or "review"
     else:
         finding.setdefault("confidence", "review")
     return finding

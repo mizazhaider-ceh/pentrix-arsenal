@@ -3,13 +3,21 @@
 The Scope class parses .txt (one domain per line, # comments) or .csv
 files (domain column: a "domain"/"target" header, else the first column).
 
+Scope entries may be:
+- a bare domain: "example.com" (matches the domain and its subdomains)
+- a wildcard: "*.example.com" (matches subdomains of example.com)
+- a CIDR range: "10.0.0.0/8" (matches IP targets inside the range)
+- a single IP: "203.0.113.7" (matches that IP exactly)
+
 CLI wiring (owned by arsenal.cli, which provides add_parsers/dispatch):
     arsenal scope <target> --import FILE | --show
 """
 
 import csv
+import ipaddress
 import json
 import os
+import urllib.parse
 
 _SCOPE_FILE = "scope.json"
 
@@ -18,14 +26,25 @@ class Scope:
     """A set of in-scope domains with membership and coverage helpers."""
 
     def __init__(self, domains=None):
+        self._domains = []    # exact-or-subdomain entries (domains and IPs)
+        self._wildcards = []  # base domains from "*.example.com" entries
+        self._cidrs = []      # ipaddress network objects
+        self._entries = []    # original entries, for save() round-trips
         seen = set()
-        ordered = []
-        for d in domains or []:
-            d = _valid_domain(d)
-            if d and d not in seen:
-                seen.add(d)
-                ordered.append(d)
-        self._domains = ordered
+        for entry in domains or []:
+            kind, value = _parse_entry(entry)
+            if value is None or (kind, value) in seen:
+                continue
+            seen.add((kind, value))
+            if kind == "wildcard":
+                self._wildcards.append(value)
+                self._entries.append("*." + value)
+            elif kind == "cidr":
+                self._cidrs.append(value)
+                self._entries.append(str(value))
+            else:
+                self._domains.append(value)
+                self._entries.append(value)
 
     @staticmethod
     def load(path):
@@ -47,9 +66,14 @@ class Scope:
         return list(self._domains)
 
     def contains(self, host):
-        """True when host is exactly in scope or a subdomain of a scope domain.
+        """True when host is in scope.
 
-        Case-insensitive; ports are stripped; trailing dots ignored.
+        Accepts bare hosts, "host:port", IPv6 literals, CIDR-matched IPs,
+        and full URLs (scheme, userinfo, path, query and fragment are
+        stripped before matching). Matching is case-insensitive; a plain
+        domain entry matches the domain and all its subdomains, a
+        "*.example.com" entry matches subdomains of example.com, and a
+        CIDR entry matches IP hosts inside the range.
         """
         host = _normalize_host(host)
         if not host:
@@ -57,14 +81,21 @@ class Scope:
         for domain in self._domains:
             if host == domain or host.endswith("." + domain):
                 return True
-        return False
+        for base in self._wildcards:
+            if host != base and host.endswith("." + base):
+                return True
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return any(addr in net for net in self._cidrs)
 
     def save(self, path):
         """Write the scope as JSON ({"domains": [...]}) to path."""
         directory = os.path.dirname(os.path.abspath(path))
         os.makedirs(directory, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"domains": self._domains}, fh, indent=2)
+            json.dump({"domains": list(self._entries)}, fh, indent=2)
 
     def coverage(self, report_data):
         """Coverage stats from report_data: domain -> {"reconned", "scanned", "reviewed"}.
@@ -92,6 +123,26 @@ class Scope:
                 "reviewed": pct(reviewed),
             },
         }
+
+
+def _parse_entry(value):
+    """Classify one scope entry.
+
+    Returns ("wildcard", base_domain), ("cidr", ip_network),
+    ("domain", normalized_host) or ("domain", None) when invalid.
+    """
+    text = (value or "").strip().lower()
+    if not text or any(ch.isspace() for ch in text):
+        return ("domain", None)
+    if "/" in text:
+        try:
+            return ("cidr", ipaddress.ip_network(text, strict=False))
+        except ValueError:
+            return ("domain", None)
+    if text.startswith("*."):
+        base = _valid_domain(text[2:])
+        return ("wildcard", base) if base else ("domain", None)
+    return ("domain", _valid_domain(text))
 
 
 def _valid_domain(value):
@@ -148,15 +199,37 @@ def _parse_csv(path):
 
 
 def _normalize_host(host):
-    """Lowercase, strip port and trailing dot from a host string."""
-    host = (host or "").strip().lower()
-    if not host:
+    """Reduce anything host-like to a bare lowercase hostname or IP.
+
+    Accepts full URLs ("https://example.com:8443/page?q=1"), "host:port",
+    "[ipv6]:port", userinfo prefixes and trailing dots. Returns "" when
+    nothing usable remains.
+    """
+    text = (host or "").strip().lower()
+    if not text:
         return ""
-    if host.startswith("["):  # [ipv6]:port
-        host = host.split("]", 1)[0][1:]
-    elif host.count(":") == 1:  # host:port
-        host = host.rsplit(":", 1)[0]
-    return host.rstrip(".")
+    if "://" in text:
+        try:
+            hostname = urllib.parse.urlsplit(text).hostname
+        except Exception:
+            hostname = None
+        if hostname:
+            return hostname.rstrip(".")
+        text = text.split("://", 1)[1]
+    for sep in ("?", "#"):
+        if sep in text:
+            text = text.split(sep, 1)[0]
+    if "/" in text:
+        text = text.split("/", 1)[0]
+    if "@" in text:  # userinfo
+        text = text.rsplit("@", 1)[1]
+    if text.startswith("["):  # [ipv6] or [ipv6]:port
+        text = text.split("]", 1)[0][1:]
+    elif text.count(":") == 1:  # host:port
+        maybe_host, maybe_port = text.rsplit(":", 1)
+        if maybe_port.isdigit():
+            text = maybe_host
+    return text.rstrip(".")
 
 
 # ------------------------------------------------------------------
